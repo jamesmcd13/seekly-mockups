@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Seekly · Buildable Feasibility (satellite + 3D massing)</title>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<style>
+  :root{
+    --bg:#0f172a;--panel:#fff;--ink:#0f172a;--muted:#64748b;--line:#e2e8f0;
+    --green:#22c55e;--primary:#3b82f6;--adu:#f59e0b;--jadu:#a855f7;--red:#ef4444;--amber:#d97706;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:#e9eef5}
+  header{background:var(--bg);color:#fff;padding:10px 18px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+  header h1{font-size:15px;margin:0;font-weight:600}
+  header .tag{font-size:11px;color:#94a3b8;border:1px solid #334155;border-radius:999px;padding:2px 9px}
+  header .spacer{flex:1}
+  header select{background:#1e293b;color:#fff;border:1px solid #334155;border-radius:6px;padding:5px 8px;font-size:12px}
+  .wrap{display:flex;height:calc(100% - 44px);min-height:0}
+  .left,.right{width:264px;background:var(--panel);padding:14px;overflow:auto;z-index:2}
+  .center{flex:1;position:relative;min-width:0}
+  #map{position:absolute;inset:0}
+  .sec{margin-bottom:16px}
+  .sec h2{font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--muted);margin:0 0 8px}
+  .scen{display:flex;flex-direction:column;gap:6px}
+  .scen button{text-align:left;border:1px solid var(--line);background:#fff;border-radius:8px;padding:8px 10px;font-size:12.5px;cursor:pointer;line-height:1.25}
+  .scen button .s{display:block;color:var(--muted);font-size:11px;margin-top:2px}
+  .scen button.active{border-color:var(--green);background:#f0fdf4;box-shadow:inset 0 0 0 1px var(--green)}
+  .palette{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .palette button{border:1px solid var(--line);background:#fff;border-radius:8px;padding:9px 6px;cursor:pointer;font-size:13px;font-weight:600}
+  .palette button:hover{border-color:var(--primary)}
+  .palette button small{display:block;font-weight:400;color:var(--muted);font-size:10.5px;margin-top:3px}
+  .row{display:flex;gap:6px;align-items:center;margin-bottom:8px}
+  .row label{font-size:12px;color:var(--muted)}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+  .seg button{border:0;background:#fff;padding:5px 10px;font-size:12px;cursor:pointer}
+  .seg button.on{background:var(--bg);color:#fff}
+  .roleSel{display:flex;gap:5px;margin-top:6px}
+  .roleSel button{flex:1;border:1px solid var(--line);background:#fff;border-radius:7px;padding:6px 4px;font-size:11px;cursor:pointer}
+  .roleSel button.on[data-role="primary"]{background:var(--primary);border-color:var(--primary);color:#fff}
+  .roleSel button.on[data-role="adu"]{background:var(--adu);border-color:var(--adu);color:#fff}
+  .roleSel button.on[data-role="jadu"]{background:var(--jadu);border-color:var(--jadu);color:#fff}
+  #bmSeg button{border:1px solid var(--line);background:#fff;border-radius:7px;padding:5px 9px;font-size:11.5px;cursor:pointer}
+  #bmSeg button.on{background:var(--bg);color:#fff;border-color:var(--bg)}
+  .toggle{display:flex;align-items:center;gap:8px;font-size:12.5px;cursor:pointer;user-select:none;margin-bottom:8px}
+  .toggle input{width:34px;height:18px;appearance:none;background:#cbd5e1;border-radius:999px;position:relative;cursor:pointer;transition:.15s;flex:none}
+  .toggle input:checked{background:var(--green)}
+  .toggle input::after{content:"";position:absolute;width:14px;height:14px;background:#fff;border-radius:50%;top:2px;left:2px;transition:.15s}
+  .toggle input:checked::after{left:18px}
+  .metric{display:flex;justify-content:space-between;align-items:baseline;padding:7px 0;border-bottom:1px dashed var(--line);font-size:13px}
+  .metric .v{font-weight:700;font-size:15px}
+  .metric .v small{font-weight:400;color:var(--muted);font-size:11px}
+  .verdict{border-radius:10px;padding:10px 12px;font-size:12.5px;line-height:1.4;margin-bottom:12px;border:1px solid}
+  .verdict.ok{background:#f0fdf4;border-color:#bbf7d0;color:#166534}
+  .verdict.warn{background:#fffbeb;border-color:#fde68a;color:#92400e}
+  .legend{font-size:11.5px;color:var(--muted);line-height:1.8}
+  .legend i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+  .btn{width:100%;border:1px solid var(--line);background:#fff;border-radius:8px;padding:9px;font-size:12.5px;cursor:pointer;margin-top:6px}
+  .btn.primary{background:var(--bg);color:#fff;border-color:var(--bg)}
+  .btn.danger{color:var(--red);border-color:#fecaca}
+  .foot{font-size:11px;color:var(--muted);margin-top:6px;line-height:1.5}
+  .pill{position:absolute;top:12px;left:12px;background:rgba(255,255,255,.94);border:1px solid var(--line);border-radius:8px;padding:7px 11px;font-size:12px;box-shadow:0 2px 10px rgba(15,23,42,.12);z-index:2}
+  .hint{position:absolute;left:50%;transform:translateX(-50%);bottom:14px;background:rgba(15,23,42,.86);color:#fff;font-size:11.5px;padding:6px 12px;border-radius:999px;pointer-events:none;z-index:2}
+</style>
+</head>
+<body>
+<header>
+  <h1>Seekly · Buildable Feasibility</h1>
+  <span class="tag">MOCKUP</span>
+  <span class="tag">MapLibre + fill-extrusion · the production stack</span>
+  <div class="spacer"></div>
+  <label style="font-size:12px;color:#94a3b8">Parcel</label>
+  <select id="parcelSel"></select>
+</header>
+
+<div class="wrap">
+  <div class="left">
+    <div class="sec"><h2>Scenario</h2><div class="scen" id="scenarios"></div></div>
+    <div class="sec"><h2>Existing house</h2>
+      <label class="toggle"><input type="checkbox" id="demoToggle"><span id="demoLbl">Keep house (build in backyard)</span></label>
+    </div>
+    <div class="sec"><h2>Place a building block</h2>
+      <div class="row"><label>Stories</label>
+        <div class="seg" id="storySeg"><button data-st="1" class="on">1 story</button><button data-st="2">2 story</button></div>
+      </div>
+      <div class="roleSel" id="roleSel">
+        <button data-role="primary" class="on">Primary</button>
+        <button data-role="adu">ADU</button>
+        <button data-role="jadu">JADU</button>
+      </div>
+      <div style="height:8px"></div>
+      <div class="palette" id="palette"></div>
+      <button class="btn primary" id="autoBtn">⚡ Auto-place max units</button>
+      <button class="btn danger" id="clearBtn">Clear placed blocks</button>
+      <div class="foot">Click a size to drop it in the green envelope, then drag it on the map. It turns red if it breaks a setback or hits the house.</div>
+    </div>
+    <div class="sec"><h2>View</h2>
+      <div class="seg" id="viewSeg"><button data-v="plan" class="on">2D plan</button><button data-v="iso" >3D massing</button></div>
+    </div>
+    <div class="sec"><h2>Basemap (QA)</h2>
+      <div id="bmSeg" style="display:flex;flex-wrap:wrap;gap:5px"></div>
+      <div class="foot">Flip sources to check whether the parcel and footprint line up. Google is often newer/sharper in LA; the offset you see is the MS Open Buildings footprint, not the parcel.</div>
+    </div>
+  </div>
+
+  <div class="center">
+    <div id="map"></div>
+    <div class="pill" id="pill"></div>
+    <div class="hint" id="hint">Real satellite. Setbacks, envelope, fit-checks and GFA computed live in the browser.</div>
+  </div>
+
+  <div class="right">
+    <div class="sec"><h2>Feasibility</h2><div class="verdict ok" id="verdict">—</div></div>
+    <div class="sec"><h2>Live metrics</h2>
+      <div class="metric"><span>Units placed</span><span class="v" id="mUnits">0 <small>/ 0</small></span></div>
+      <div class="metric"><span>New GFA</span><span class="v" id="mGfa">0 <small>sf</small></span></div>
+      <div class="metric"><span>Total GFA</span><span class="v" id="mGfaTot">0 <small>sf</small></span></div>
+      <div class="metric"><span>FAR used</span><span class="v" id="mFar">0 <small>/ 0.50</small></span></div>
+      <div class="metric"><span>Lot coverage</span><span class="v" id="mCov">0 <small>%</small></span></div>
+      <div class="metric"><span>Envelope</span><span class="v" id="mEnv">0 <small>sf</small></span></div>
+      <div class="metric"><span>Envelope remaining</span><span class="v" id="mRem">0 <small>sf</small></span></div>
+    </div>
+    <div class="sec"><h2>Setbacks applied</h2><div id="sbInfo" class="legend"></div></div>
+    <div class="sec"><h2>Legend</h2>
+      <div class="legend">
+        <div><i style="background:rgba(34,197,94,.45);border:1px solid var(--green)"></i>Buildable envelope</div>
+        <div><i style="background:var(--primary)"></i>Primary dwelling</div>
+        <div><i style="background:var(--adu)"></i>ADU</div>
+        <div><i style="background:var(--jadu)"></i>JADU</div>
+      </div>
+      <div class="foot">Real parcel + MS Open Buildings footprint from Seekly's 500-parcel sample. Satellite: Esri World Imagery. No Rhino, no Grasshopper.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ===== DATA: real parcels (EPSG:4326) ===== */
+const PARCELS=[
+ {ain:"2118023009",zone:"R1-1",addr:"18745 Cantlay St, Reseda 91335",lot_sf:7455,w:55.0,d:135.5,house_sf:2882,
+  ring:[[-118.542065461185,34.2025055835419],[-118.542064829722,34.2021331344821],[-118.542246727669,34.202132923854],[-118.542247359943,34.2025053729128]],
+  house:[[-118.542149,34.20234],[-118.542096,34.20234],[-118.542095,34.202194],[-118.542188,34.202193],[-118.542188,34.202224],[-118.542242,34.202224],[-118.542242,34.202292],[-118.54224,34.202292],[-118.542241,34.20241],[-118.542149,34.202411]]},
+ {ain:"2201015016",zone:"R1-1",addr:"17353 Willard St, Northridge 91325",lot_sf:5997,w:60.0,d:100.0,house_sf:1640,
+  ring:[[-118.511639503651,34.2188182021799],[-118.511837862601,34.2188154672281],[-118.511843472533,34.2190901637736],[-118.511645098775,34.2190929503177]],
+  house:[[-118.511664,34.218914],[-118.511702,34.218913],[-118.511701,34.21888],[-118.511835,34.218879],[-118.511836,34.218969],[-118.511716,34.21897],[-118.511716,34.218984],[-118.511665,34.218985]]},
+ {ain:"2163013007",zone:"R1-1",addr:"5432 Tampa Ave, Tarzana 91356",lot_sf:6981,w:50.0,d:139.6,house_sf:2428,
+  ring:[[-118.552908170108,34.1700745631363],[-118.552907889,34.1699371688119],[-118.553369466309,34.1699364589879],[-118.553369781236,34.1700738531599]],
+  house:[[-118.553285,34.170041],[-118.5531,34.170044],[-118.553099,34.170004],[-118.553,34.170006],[-118.552998,34.169947],[-118.553111,34.169944],[-118.553112,34.169978],[-118.553155,34.169977],[-118.553154,34.16995],[-118.553283,34.169948]]}
+];
+const SCENARIOS=[
+ {id:"city",name:"City zoning (R1 base)",sub:"front 20 · side 5 · rear 15",front:20,side:5,rear:15,cap:3,capNote:"1 primary + 1 ADU + 1 JADU"},
+ {id:"sb9",name:"SB9 — 2 units (no lot split)",sub:"front 20 · side 4 · rear 4",front:20,side:4,rear:4,cap:4,capNote:"2 primary + 1 ADU + 1 JADU"},
+ {id:"adu",name:"ADU / JADU focus",sub:"front 20 · side 4 · rear 4",front:20,side:4,rear:4,cap:3,capNote:"existing + 1 ADU + 1 JADU"}
+];
+const SIZES=[100,200,400,800], STORY_H_M=3.35, HOUSE_H_M=4.3, RFAR=0.50, FT2M=0.3048, K=364000;
+const BASEMAPS=[
+ {id:"esri",name:"Esri",max:19,attr:"Esri, Maxar, Earthstar Geographics",tiles:["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"]},
+ {id:"clarity",name:"Esri Clarity",max:19,attr:"Esri Clarity, Maxar",tiles:["https://clarity.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"]},
+ {id:"google",name:"Google",max:21,attr:"Imagery © Google",tiles:["https://mt0.google.com/vt/lyrs=s&x={x}&y={y}&z={z}","https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}","https://mt2.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"]},
+ {id:"googleHy",name:"Google Hybrid",max:21,attr:"Imagery © Google",tiles:["https://mt0.google.com/vt/lyrs=y&x={x}&y={y}&z={z}","https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}","https://mt2.google.com/vt/lyrs=y&x={x}&y={y}&z={z}"]}
+];
+let activeBM="esri";
+
+/* ===== STATE ===== */
+let P=null, scenario=SCENARIOS[1], demo=false, stories=1, role="primary", view="plan";
+let blocks=[], sel=null, grab=null, blockId=1, map=null, loaded=false;
+
+/* ===== GEOMETRY (local feet frame) ===== */
+function project(ring,lat0,lon0){const k=Math.cos(lat0*Math.PI/180);return ring.map(([lon,lat])=>[(lon-lon0)*K*k,(lat-lat0)*K]);}
+function centroid(r){let x=0,y=0;r.forEach(p=>{x+=p[0];y+=p[1]});return[x/r.length,y/r.length];}
+function rot(p,a){const c=Math.cos(a),s=Math.sin(a);return[p[0]*c-p[1]*s,p[0]*s+p[1]*c];}
+function rotAll(p,a){return p.map(q=>rot(q,a));}
+function bbox(p){const xs=p.map(q=>q[0]),ys=p.map(q=>q[1]);return{minx:Math.min(...xs),maxx:Math.max(...xs),miny:Math.min(...ys),maxy:Math.max(...ys)};}
+function polyArea(p){let a=0;for(let i=0;i<p.length;i++){const[x1,y1]=p[i],[x2,y2]=p[(i+1)%p.length];a+=x1*y2-x2*y1;}return Math.abs(a/2);}
+function pip(pt,poly){let c=false;for(let i=0,j=poly.length-1;i<poly.length;j=i++){const[xi,yi]=poly[i],[xj,yj]=poly[j];if(((yi>pt[1])!=(yj>pt[1]))&&(pt[0]<(xj-xi)*(pt[1]-yi)/(yj-yi)+xi))c=!c;}return c;}
+function segInt(a,b,c,d){function w(p,q,r){return(r[1]-p[1])*(q[0]-p[0])>(q[1]-p[1])*(r[0]-p[0]);}return w(a,c,d)!=w(b,c,d)&&w(a,b,c)!=w(a,b,d);}
+function polyOverlap(A,B){for(const p of A)if(pip(p,B))return true;for(const p of B)if(pip(p,A))return true;for(let i=0;i<A.length;i++)for(let j=0;j<B.length;j++)if(segInt(A[i],A[(i+1)%A.length],B[j],B[(j+1)%B.length]))return true;return false;}
+function blockCorners(b){const h=b.side/2;return[[b.cx-h,b.cy-h],[b.cx+h,b.cy-h],[b.cx+h,b.cy+h],[b.cx-h,b.cy+h]];}
+
+function buildModel(rec){
+  const[lon0,lat0]=centroid(rec.ring); const cosL=Math.cos(lat0*Math.PI/180);
+  let ring=project(rec.ring,lat0,lon0), house=project(rec.house,lat0,lon0);
+  let best=0,bi=0;
+  for(let i=0;i<ring.length;i++){const[x1,y1]=ring[i],[x2,y2]=ring[(i+1)%ring.length];const L=Math.hypot(x2-x1,y2-y1);if(L>best){best=L;bi=i;}}
+  const[ex1,ey1]=ring[bi],[ex2,ey2]=ring[(bi+1)%ring.length];
+  const a=(Math.PI/2)-Math.atan2(ey2-ey1,ex2-ex1);
+  ring=rotAll(ring,a); house=rotAll(house,a);
+  const b0=bbox(ring), cx=(b0.minx+b0.maxx)/2, cy=(b0.miny+b0.maxy)/2;
+  ring=ring.map(p=>[p[0]-cx,p[1]-cy]); house=house.map(p=>[p[0]-cx,p[1]-cy]);
+  const flip=centroid(house)[1]>0?-1:1;
+  if(flip<0){ring=ring.map(p=>[p[0],-p[1]]);house=house.map(p=>[p[0],-p[1]]);}
+  return {rec,ring,house,bb:bbox(ring),w:rec.w,d:rec.d,tf:{lon0,lat0,cosL,a,cx,cy,flip}};
+}
+function toLL(p){const t=P.tf;let y=p[1]*t.flip;const fr=rot([p[0]+t.cx,y+t.cy],-t.a);return[t.lon0+fr[0]/(K*t.cosL),t.lat0+fr[1]/K];}
+function toLocal(ll){const t=P.tf;const fx=(ll[0]-t.lon0)*K*t.cosL,fy=(ll[1]-t.lat0)*K;const r=rot([fx,fy],t.a);return[r[0]-t.cx,(r[1]-t.cy)*t.flip];}
+function ringLL(r){const o=r.map(toLL);o.push(o[0]);return o;}
+
+function envRect(){const b=P.bb;return{x0:b.minx+scenario.side,x1:b.maxx-scenario.side,y0:b.miny+scenario.front,y1:b.maxy-scenario.rear};}
+function envPoly(){const e=envRect();return[[e.x0,e.y0],[e.x1,e.y0],[e.x1,e.y1],[e.x0,e.y1]];}
+function inEnv(b){const e=envRect();for(const c of blockCorners(b))if(c[0]<e.x0-.05||c[0]>e.x1+.05||c[1]<e.y0-.05||c[1]>e.y1+.05)return false;return true;}
+function hitsHouse(b){return false;} /* footprint overlay hidden in satellite view; user places against the real roof in the imagery */
+function hitsOther(b){for(const o of blocks){if(o.id===b.id||o.role==="jadu"||b.role==="jadu")continue;if(polyOverlap(blockCorners(b),blockCorners(o)))return true;}return false;}
+function blockOk(b){return inEnv(b)&&!hitsHouse(b)&&!hitsOther(b);}
+function roleColor(r){return r==="adu"?"#f59e0b":r==="jadu"?"#a855f7":"#3b82f6";}
+
+/* ===== METRICS ===== */
+function compute(){
+  const ok=blocks.filter(blockOk);
+  const newGfa=ok.reduce((s,b)=>s+b.gfa,0);
+  const newFoot=ok.filter(b=>b.role!=="jadu").reduce((s,b)=>s+b.side*b.side,0);
+  const existGfa=demo?0:P.rec.house_sf, existFoot=demo?0:polyArea(P.house);
+  const totGfa=newGfa+existGfa, cov=(newFoot+existFoot)/P.rec.lot_sf*100, far=totGfa/P.rec.lot_sf;
+  const env=polyArea(envPoly()), rem=Math.max(0,env-newFoot-(demo?0:polyArea(P.house)));
+  const units=ok.length+(!demo&&scenario.id==="adu"?1:0);
+  return{ok,newGfa,totGfa,cov,far,env,rem,units,bad:blocks.length-ok.length};
+}
+
+/* ===== MAP SOURCES ===== */
+function feat(localRing,props){return{type:"Feature",properties:props||{},geometry:{type:"Polygon",coordinates:[ringLL(localRing)]}};}
+function updateSources(){
+  if(!loaded)return;
+  map.getSource("parcel").setData(feat(P.ring,{}));
+  map.getSource("env").setData(feat(envPoly(),{}));
+  map.getSource("house").setData({type:"FeatureCollection",features:[]}); // overlay hidden: the real roof is visible in the satellite imagery
+  const bf=blocks.map(b=>feat(blockCorners(b),{color:blockOk(b)?roleColor(b.role):"#ef4444",h:b.stories*STORY_H_M,sel:b===sel}));
+  map.getSource("blocks").setData({type:"FeatureCollection",features:bf});
+}
+
+/* ===== REFRESH PANEL ===== */
+function refresh(){
+  const m=compute();
+  document.getElementById("mUnits").innerHTML=m.units+' <small>/ '+scenario.cap+'</small>';
+  document.getElementById("mGfa").innerHTML=m.newGfa.toLocaleString()+' <small>sf</small>';
+  document.getElementById("mGfaTot").innerHTML=m.totGfa.toLocaleString()+' <small>sf</small>';
+  const far=document.getElementById("mFar");far.innerHTML=m.far.toFixed(2)+' <small>/ '+RFAR.toFixed(2)+'</small>';far.style.color=m.far>RFAR?"var(--amber)":"";
+  document.getElementById("mCov").innerHTML=m.cov.toFixed(0)+' <small>%</small>';
+  document.getElementById("mEnv").innerHTML=Math.round(m.env).toLocaleString()+' <small>sf</small>';
+  document.getElementById("mRem").innerHTML=Math.round(m.rem).toLocaleString()+' <small>sf</small>';
+  const v=document.getElementById("verdict");
+  if(m.bad>0){v.className="verdict warn";v.innerHTML="⚠ "+m.bad+" block"+(m.bad>1?"s":"")+" break a setback or hit the house. Drag into the green envelope.";}
+  else if(m.units>scenario.cap){v.className="verdict warn";v.innerHTML="⚠ "+m.units+" units exceeds the "+scenario.cap+"-unit cap ("+scenario.capNote+").";}
+  else if(m.units===0){v.className="verdict ok";v.innerHTML="Pick a block size to test what fits under <b>"+scenario.name+"</b>.";}
+  else{v.className="verdict ok";v.innerHTML="✓ "+m.units+" unit"+(m.units>1?"s":"")+" fit · "+m.newGfa.toLocaleString()+" sf new · "+m.totGfa.toLocaleString()+" sf total. Cap "+scenario.cap+" ("+scenario.capNote+").";}
+  document.getElementById("sbInfo").innerHTML="Front <b>"+scenario.front+"′</b> &nbsp; Side <b>"+scenario.side+"′</b> &nbsp; Rear <b>"+scenario.rear+"′</b><br><span style='color:#94a3b8'>"+(scenario.id==="city"?"Standard R1 yards (CP-7150 Table 1a).":"SB9 / state ADU cap side &amp; rear at 4′ (Gov Code 65852.21 / 66323).")+"</span>";
+  document.getElementById("pill").innerHTML="<b>"+P.rec.ain+"</b> · "+P.rec.zone+" · "+P.rec.lot_sf.toLocaleString()+" sf · "+P.rec.addr;
+  updateSources();
+}
+
+/* ===== ACTIONS ===== */
+function addBlock(gfa){
+  const side=Math.sqrt(gfa/stories), e=envRect();
+  let cy=demo?(e.y0+e.y1)/2:e.y1-side/2-2, cx=(e.x0+e.x1)/2;
+  const b={id:blockId++,role,gfa,stories,side,cx,cy};
+  if(!blockOk(b)){const step=4;outer:for(let y=e.y1-side/2;y>=e.y0+side/2;y-=step)for(let x=e.x0+side/2;x<=e.x1-side/2;x+=step){b.cx=x;b.cy=y;if(blockOk(b))break outer;}}
+  blocks.push(b);sel=b;refresh();
+}
+function autoPlace(){
+  const m=compute();let capLeft=scenario.cap-m.units;const gfa=400,st=stories,side=Math.sqrt(gfa/st),e=envRect(),gap=3;let n=0;
+  for(let y=e.y1-side/2;y>=e.y0+side/2&&capLeft>0;y-=(side+gap))for(let x=e.x0+side/2;x<=e.x1-side/2&&capLeft>0;x+=(side+gap)){
+    const b={id:blockId++,role:n===0&&scenario.id!=="city"?"primary":"adu",gfa,stories:st,side,cx:x,cy:y};
+    if(blockOk(b)){blocks.push(b);n++;capLeft--;}else blockId--;
+  }
+  sel=null;refresh();
+  document.getElementById("hint").textContent=n?("Greedy grid-sweep placed "+n+" block"+(n>1?"s":"")+" — drag to refine."):"No room for more units under these setbacks.";
+}
+function loadParcel(i){
+  P=buildModel(PARCELS[i]);blocks=[];sel=null;
+  const lls=P.ring.map(toLL),xs=lls.map(p=>p[0]),ys=lls.map(p=>p[1]);
+  if(loaded){map.fitBounds([[Math.min(...xs),Math.min(...ys)],[Math.max(...xs),Math.max(...ys)]],{padding:90,pitch:view==="iso"?55:0,duration:600});}
+  refresh();
+}
+function setView(v){view=v;map.easeTo({pitch:v==="iso"?55:0,bearing:v==="iso"?-18:0,duration:600});document.getElementById("hint").textContent=v==="iso"?"3D massing via Mapbox-style fill-extrusion. Drag to orbit.":"Real satellite. Setbacks, envelope and GFA computed live in the browser.";}
+
+/* ===== UI ===== */
+function buildUI(){
+  const ps=document.getElementById("parcelSel");
+  PARCELS.forEach((p,i)=>{const o=document.createElement("option");o.value=i;o.textContent=p.ain+" · "+p.addr;ps.appendChild(o);});
+  ps.onchange=()=>loadParcel(+ps.value);
+  const sc=document.getElementById("scenarios");
+  SCENARIOS.forEach(s=>{const b=document.createElement("button");b.innerHTML=s.name+"<span class='s'>"+s.sub+"</span>";if(s===scenario)b.classList.add("active");b.onclick=()=>{scenario=s;[...sc.children].forEach(c=>c.classList.remove("active"));b.classList.add("active");refresh();};sc.appendChild(b);});
+  const pal=document.getElementById("palette");
+  SIZES.forEach(g=>{const b=document.createElement("button");b.innerHTML=g+" sf<small>GFA</small>";b.onclick=()=>addBlock(g);pal.appendChild(b);});
+  document.querySelectorAll("#storySeg button").forEach(b=>b.onclick=()=>{stories=+b.dataset.st;document.querySelectorAll("#storySeg button").forEach(x=>x.classList.remove("on"));b.classList.add("on");});
+  document.querySelectorAll("#roleSel button").forEach(b=>b.onclick=()=>{role=b.dataset.role;document.querySelectorAll("#roleSel button").forEach(x=>x.classList.remove("on"));b.classList.add("on");});
+  document.querySelectorAll("#viewSeg button").forEach(b=>b.onclick=()=>{document.querySelectorAll("#viewSeg button").forEach(x=>x.classList.remove("on"));b.classList.add("on");setView(b.dataset.v);});
+  const dt=document.getElementById("demoToggle");
+  dt.onchange=()=>{demo=dt.checked;document.getElementById("demoLbl").textContent=demo?"Demolish house (full-lot redevelopment)":"Keep house (build in backyard)";refresh();};
+  document.getElementById("autoBtn").onclick=autoPlace;
+  document.getElementById("clearBtn").onclick=()=>{blocks=[];sel=null;refresh();};
+  const bmSeg=document.getElementById("bmSeg");
+  BASEMAPS.forEach(b=>{const x=document.createElement("button");x.textContent=b.name;if(b.id===activeBM)x.classList.add("on");x.onclick=()=>{activeBM=b.id;BASEMAPS.forEach(o=>{if(map.getLayer("bm-"+o.id))map.setLayoutProperty("bm-"+o.id,"visibility",o.id===b.id?"visible":"none");});[...bmSeg.children].forEach(c=>c.classList.remove("on"));x.classList.add("on");};bmSeg.appendChild(x);});
+}
+
+/* ===== INIT MAP ===== */
+buildUI();
+P=buildModel(PARCELS[0]);
+const c0=centroid(PARCELS[0].ring);
+map=new maplibregl.Map({
+  container:"map",
+  style:{version:8,sources:{},layers:[]},
+  center:c0, zoom:18.5, pitch:0, bearing:0, maxPitch:70
+});
+map.addControl(new maplibregl.NavigationControl({visualizePitch:true}),"bottom-right");
+map.on("load",()=>{
+  BASEMAPS.forEach(bm=>{
+    map.addSource("bm-"+bm.id,{type:"raster",tiles:bm.tiles,tileSize:256,maxzoom:bm.max,attribution:bm.attr});
+    map.addLayer({id:"bm-"+bm.id,type:"raster",source:"bm-"+bm.id,layout:{visibility:bm.id===activeBM?"visible":"none"}});
+  });
+  const empty={type:"FeatureCollection",features:[]};
+  map.addSource("parcel",{type:"geojson",data:empty});
+  map.addSource("env",{type:"geojson",data:empty});
+  map.addSource("house",{type:"geojson",data:empty});
+  map.addSource("blocks",{type:"geojson",data:empty});
+  map.addLayer({id:"env-fill",type:"fill",source:"env",paint:{"fill-color":"#22c55e","fill-opacity":0.22}});
+  map.addLayer({id:"env-line",type:"line",source:"env",paint:{"line-color":"#16a34a","line-width":2,"line-dasharray":[2,1.4]}});
+  map.addLayer({id:"parcel-line",type:"line",source:"parcel",paint:{"line-color":"#ffffff","line-width":2.5}});
+  map.addLayer({id:"house-3d",type:"fill-extrusion",source:"house",paint:{"fill-extrusion-color":"#64748b","fill-extrusion-height":HOUSE_H_M,"fill-extrusion-opacity":0.92}});
+  map.addLayer({id:"blocks-3d",type:"fill-extrusion",source:"blocks",paint:{"fill-extrusion-color":["get","color"],"fill-extrusion-height":["get","h"],"fill-extrusion-opacity":0.86}});
+  map.addLayer({id:"blocks-sel",type:"line",source:"blocks",filter:["==",["get","sel"],true],paint:{"line-color":"#ffffff","line-width":3}});
+  loaded=true;
+  const lls=P.ring.map(toLL),xs=lls.map(p=>p[0]),ys=lls.map(p=>p[1]);
+  map.fitBounds([[Math.min(...xs),Math.min(...ys)],[Math.max(...xs),Math.max(...ys)]],{padding:90,duration:0});
+  refresh();
+});
+
+/* ===== DRAG ===== */
+map && map.on("mousedown",e=>{
+  const loc=toLocal([e.lngLat.lng,e.lngLat.lat]);let hit=null;
+  for(let i=blocks.length-1;i>=0;i--)if(pip(loc,blockCorners(blocks[i]))){hit=blocks[i];break;}
+  if(hit){sel=hit;grab={dx:loc[0]-hit.cx,dy:loc[1]-hit.cy};map.dragPan.disable();map.getCanvas().style.cursor="grabbing";}
+  else{sel=null;}
+  updateSources();
+});
+map && map.on("mousemove",e=>{
+  if(!grab||!sel){const loc=toLocal([e.lngLat.lng,e.lngLat.lat]);let over=false;for(const b of blocks)if(pip(loc,blockCorners(b))){over=true;break;}map.getCanvas().style.cursor=over?"grab":"";return;}
+  const loc=toLocal([e.lngLat.lng,e.lngLat.lat]);sel.cx=loc[0]-grab.dx;sel.cy=loc[1]-grab.dy;refresh();
+});
+function endDrag(){if(grab){grab=null;map.dragPan.enable();map.getCanvas().style.cursor="";}}
+map && map.on("mouseup",endDrag);
+window.addEventListener("keydown",e=>{if((e.key==="Delete"||e.key==="Backspace")&&sel){blocks=blocks.filter(b=>b!==sel);sel=null;refresh();}});
+</script>
+</body>
+</html>
