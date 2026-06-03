@@ -290,7 +290,7 @@ function buildUI(){
   document.getElementById("autoBtn").onclick=autoPlace;
   document.getElementById("clearBtn").onclick=()=>{blocks=[];sel=null;refresh();};
   const bmSeg=document.getElementById("bmSeg");
-  BASEMAPS.forEach(b=>{const x=document.createElement("button");x.textContent=b.name;if(b.id===activeBM)x.classList.add("on");x.onclick=()=>{activeBM=b.id;BASEMAPS.forEach(o=>{if(map.getLayer("bm-"+o.id))map.setLayoutProperty("bm-"+o.id,"visibility",o.id===b.id?"visible":"none");});[...bmSeg.children].forEach(c=>c.classList.remove("on"));x.classList.add("on");};bmSeg.appendChild(x);});
+  BASEMAPS.forEach(b=>{const x=document.createElement("button");x.textContent=b.name;if(b.id===activeBM)x.classList.add("on");x.onclick=()=>{activeBM=b.id;const s=map.getSource("sat");if(s&&s.setTiles)s.setTiles(b.tiles);[...bmSeg.children].forEach(c=>c.classList.remove("on"));x.classList.add("on");};bmSeg.appendChild(x);});
 }
 
 /* ===== INIT MAP ===== */
@@ -299,15 +299,11 @@ P=buildModel(PARCELS[0]);
 const c0=centroid(PARCELS[0].ring);
 map=new maplibregl.Map({
   container:"map",
-  style:{version:8,sources:{},layers:[]},
+  style:{version:8,sources:{sat:{type:"raster",tiles:BASEMAPS[0].tiles,tileSize:256,maxzoom:19,attribution:BASEMAPS[0].attr}},layers:[{id:"sat",type:"raster",source:"sat"}]},
   center:c0, zoom:18.5, pitch:0, bearing:0, maxPitch:70
 });
 map.addControl(new maplibregl.NavigationControl({visualizePitch:true}),"bottom-right");
 map.on("load",()=>{
-  BASEMAPS.forEach(bm=>{
-    map.addSource("bm-"+bm.id,{type:"raster",tiles:bm.tiles,tileSize:256,maxzoom:bm.max,attribution:bm.attr});
-    map.addLayer({id:"bm-"+bm.id,type:"raster",source:"bm-"+bm.id,layout:{visibility:bm.id===activeBM?"visible":"none"}});
-  });
   const empty={type:"FeatureCollection",features:[]};
   map.addSource("parcel",{type:"geojson",data:empty});
   map.addSource("env",{type:"geojson",data:empty});
