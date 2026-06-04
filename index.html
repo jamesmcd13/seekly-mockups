@@ -101,7 +101,7 @@
     </div>
     <div class="sec"><h2>Basemap (QA)</h2>
       <div id="bmSeg" style="display:flex;flex-wrap:wrap;gap:5px"></div>
-      <div class="foot">Flip sources to check whether the parcel and footprint line up. Google is often newer/sharper in LA; the offset you see is the MS Open Buildings footprint, not the parcel.</div>
+      <div class="foot">Google satellite, Google Hybrid (with street labels), or a plain street Map.</div>
     </div>
   </div>
 
@@ -130,7 +130,7 @@
         <div><i style="background:var(--adu)"></i>ADU</div>
         <div><i style="background:var(--jadu)"></i>JADU</div>
       </div>
-      <div class="foot">Real parcel + MS Open Buildings footprint from Seekly's 500-parcel sample. Satellite: Esri World Imagery. No Rhino, no Grasshopper.</div>
+      <div class="foot">Real parcel from Seekly's 500-parcel sample; the existing house carves the buildable yard. Imagery: Google. No Rhino, no Grasshopper.</div>
     </div>
   </div>
 </div>
@@ -156,12 +156,11 @@ const SCENARIOS=[
 ];
 const SIZES=[100,200,400,800], STORY_H_M=3.35, HOUSE_H_M=4.3, RFAR=0.50, FT2M=0.3048, K=364000;
 const BASEMAPS=[
- {id:"esri",name:"Esri",max:19,attr:"Esri, Maxar, Earthstar Geographics",tiles:["https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"]},
- {id:"clarity",name:"Esri Clarity",max:19,attr:"Esri Clarity, Maxar",tiles:["https://clarity.maptiles.arcgis.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"]},
  {id:"google",name:"Google",max:21,attr:"Imagery © Google",tiles:["https://mt0.google.com/vt/lyrs=s&x={x}&y={y}&z={z}","https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}","https://mt2.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"]},
- {id:"googleHy",name:"Google Hybrid",max:21,attr:"Imagery © Google",tiles:["https://mt0.google.com/vt/lyrs=y&x={x}&y={y}&z={z}","https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}","https://mt2.google.com/vt/lyrs=y&x={x}&y={y}&z={z}"]}
+ {id:"googleHy",name:"Google Hybrid",max:21,attr:"Imagery © Google",tiles:["https://mt0.google.com/vt/lyrs=y&x={x}&y={y}&z={z}","https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}","https://mt2.google.com/vt/lyrs=y&x={x}&y={y}&z={z}"]},
+ {id:"map",name:"Map",max:21,attr:"Map data © Google",tiles:["https://mt0.google.com/vt/lyrs=m&x={x}&y={y}&z={z}","https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}","https://mt2.google.com/vt/lyrs=m&x={x}&y={y}&z={z}"]}
 ];
-let activeBM="esri";
+let activeBM="google";
 
 /* ===== STATE ===== */
 let P=null, scenario=SCENARIOS[1], demo=false, stories=1, role="primary", view="plan";
@@ -197,7 +196,21 @@ function toLL(p){const t=P.tf;let y=p[1]*t.flip;const fr=rot([p[0]+t.cx,y+t.cy],
 function toLocal(ll){const t=P.tf;const fx=(ll[0]-t.lon0)*K*t.cosL,fy=(ll[1]-t.lat0)*K;const r=rot([fx,fy],t.a);return[r[0]-t.cx,(r[1]-t.cy)*t.flip];}
 function ringLL(r){const o=r.map(toLL);o.push(o[0]);return o;}
 
-function envRect(){const b=P.bb;return{x0:b.minx+scenario.side,x1:b.maxx-scenario.side,y0:b.miny+scenario.front,y1:b.maxy-scenario.rear};}
+function envRect(){
+  const b=P.bb;
+  const x0=b.minx+scenario.side, x1=b.maxx-scenario.side;
+  let y0=b.miny+scenario.front, y1=b.maxy-scenario.rear;
+  // Keep house: the buildable area is the open yard. Remove the house's depth band
+  // and keep the larger remaining strip (front yard or back yard). Demolish: full lot.
+  if(!demo && P.house && P.house.length){
+    const ys=P.house.map(p=>p[1]);
+    const hy0=Math.min.apply(null,ys), hy1=Math.max.apply(null,ys);
+    const rearH=y1-Math.max(y0,hy1);     // strip behind the house
+    const frontH=Math.min(y1,hy0)-y0;    // strip in front of the house
+    if(rearH>=frontH){ y0=Math.max(y0,hy1); } else { y1=Math.min(y1,hy0); }
+  }
+  return {x0,x1,y0,y1};
+}
 function envPoly(){const e=envRect();return[[e.x0,e.y0],[e.x1,e.y0],[e.x1,e.y1],[e.x0,e.y1]];}
 function inEnv(b){const e=envRect();for(const c of blockCorners(b))if(c[0]<e.x0-.05||c[0]>e.x1+.05||c[1]<e.y0-.05||c[1]>e.y1+.05)return false;return true;}
 function hitsHouse(b){return false;} /* footprint overlay hidden in satellite view; user places against the real roof in the imagery */
@@ -299,7 +312,7 @@ P=buildModel(PARCELS[0]);
 const c0=centroid(PARCELS[0].ring);
 map=new maplibregl.Map({
   container:"map",
-  style:{version:8,sources:{sat:{type:"raster",tiles:BASEMAPS[0].tiles,tileSize:256,maxzoom:19,attribution:BASEMAPS[0].attr}},layers:[{id:"sat",type:"raster",source:"sat"}]},
+  style:{version:8,sources:{sat:{type:"raster",tiles:BASEMAPS[0].tiles,tileSize:256,maxzoom:20,attribution:BASEMAPS[0].attr}},layers:[{id:"sat",type:"raster",source:"sat"}]},
   center:c0, zoom:18.5, pitch:0, bearing:0, maxPitch:70
 });
 map.addControl(new maplibregl.NavigationControl({visualizePitch:true}),"bottom-right");
