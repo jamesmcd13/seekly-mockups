@@ -4,6 +4,16 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Seekly · Buildable Feasibility (satellite + 3D massing)</title>
+<script>
+  /* Auto-detect: send phones to the touch-optimized build. Add ?desktop=1 to override. */
+  (function(){
+    if(/[?&]desktop/.test(location.search))return;
+    var ua=/Mobi|Android|iPhone|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    var ipad=navigator.platform==="MacIntel"&&navigator.maxTouchPoints>1; // iPadOS reports as Mac
+    var smallTouch=("ontouchstart"in window)&&Math.min(screen.width,screen.height)<=820;
+    if(ua||ipad||smallTouch)location.replace("mobile.html"+location.search);
+  })();
+</script>
 <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
 <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 <style>

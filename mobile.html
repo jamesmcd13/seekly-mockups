@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<title>Seekly · Buildable Feasibility (mobile)</title>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<style>
+  :root{
+    --bg:#0f172a;--panel:#fff;--ink:#0f172a;--muted:#64748b;--line:#e2e8f0;
+    --green:#22c55e;--primary:#3b82f6;--adu:#f59e0b;--jadu:#a855f7;--red:#ef4444;--amber:#d97706;
+    --sheet-peek:120px;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:#0f172a;touch-action:manipulation}
+
+  /* Floating search bar (Redfin-style) */
+  .searchbar{position:fixed;top:calc(10px + env(safe-area-inset-top));left:10px;right:10px;z-index:6;
+    background:#fff;border-radius:13px;box-shadow:0 4px 16px rgba(15,23,42,.22);
+    display:flex;align-items:center;gap:10px;padding:11px 13px}
+  .searchbar .logo{font-weight:800;font-size:15px;color:var(--bg);letter-spacing:-.3px}
+  .searchbar .logo b{color:var(--green)}
+  .searchbar .field{flex:1;position:relative;min-width:0}
+  .searchbar .field .ico{position:absolute;left:0;top:50%;transform:translateY(-50%);color:var(--muted);font-size:14px;pointer-events:none}
+  .searchbar select{width:100%;-webkit-appearance:none;appearance:none;border:0;background:transparent;
+    font-size:13.5px;font-weight:600;color:var(--ink);padding:0 16px 0 22px;text-overflow:ellipsis;white-space:nowrap;overflow:hidden}
+  .searchbar .field::after{content:"⌄";position:absolute;right:0;top:48%;transform:translateY(-50%);color:var(--muted);font-size:15px;pointer-events:none}
+  .searchbar .tag{font-size:9.5px;color:#94a3b8;border:1px solid var(--line);border-radius:999px;padding:2px 7px;flex:none}
+
+  /* Map */
+  #map{position:fixed;inset:0;top:0}
+  .pill{position:absolute;top:calc(66px + env(safe-area-inset-top));left:10px;right:10px;background:rgba(255,255,255,.94);
+    border:1px solid var(--line);border-radius:9px;padding:7px 11px;font-size:11.5px;line-height:1.3;
+    box-shadow:0 2px 10px rgba(15,23,42,.18);z-index:3}
+  .hint{position:absolute;left:50%;transform:translateX(-50%);bottom:calc(var(--sheet-peek) + 60px);
+    background:rgba(15,23,42,.9);color:#fff;font-size:11.5px;padding:7px 13px;border-radius:999px;
+    max-width:90%;text-align:center;z-index:3;transition:opacity .3s;pointer-events:none}
+
+  /* Map ⇄ Build toggle (Redfin-style List/Map switch) */
+  .viewToggle{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(env(safe-area-inset-bottom) + 16px);z-index:9;
+    background:var(--bg);color:#fff;border:0;border-radius:999px;padding:11px 20px;font-size:13.5px;font-weight:700;
+    box-shadow:0 4px 16px rgba(15,23,42,.4);display:flex;align-items:center;gap:8px;cursor:pointer;transition:opacity .2s}
+
+  /* Floating map controls (top-right) */
+  .mapctl{position:absolute;top:calc(66px + env(safe-area-inset-top));right:10px;z-index:3;display:flex;flex-direction:column;gap:8px;align-items:flex-end}
+  .seg{display:inline-flex;border:1px solid rgba(255,255,255,.25);border-radius:9px;overflow:hidden;box-shadow:0 2px 8px rgba(15,23,42,.25)}
+  .seg button{border:0;background:rgba(15,23,42,.82);color:#fff;padding:8px 12px;font-size:12px;font-weight:600;cursor:pointer}
+  .seg button.on{background:var(--primary)}
+  .fab{width:48px;height:48px;border-radius:50%;border:0;background:var(--red);color:#fff;font-size:20px;
+    box-shadow:0 3px 12px rgba(239,68,68,.5);display:none;align-items:center;justify-content:center;cursor:pointer}
+  .fab.show{display:flex}
+
+  /* Bottom sheet */
+  .sheet{position:fixed;left:0;right:0;bottom:0;z-index:7;background:var(--panel);
+    border-radius:20px 20px 0 0;box-shadow:0 -6px 28px rgba(15,23,42,.26);
+    height:90vh;transform:translateY(calc(90vh - var(--sheet-peek)));
+    transition:transform .3s cubic-bezier(.32,.72,0,1);display:flex;flex-direction:column;
+    padding-bottom:env(safe-area-inset-bottom);will-change:transform;touch-action:none}
+  .sheet.dragging{transition:none}
+  .grab{flex:none;padding:10px 0 6px;display:flex;justify-content:center;cursor:grab;touch-action:none}
+  .grab span{width:40px;height:5px;border-radius:999px;background:#cbd5e1}
+
+  /* Peek bar: verdict summary + tabs (always visible) */
+  .peek{flex:none;padding:0 14px 8px;cursor:pointer}
+  .verdict{border-radius:10px;padding:9px 11px;font-size:12.5px;line-height:1.35;border:1px solid;margin:0}
+  .verdict.ok{background:#f0fdf4;border-color:#bbf7d0;color:#166534}
+  .verdict.warn{background:#fffbeb;border-color:#fde68a;color:#92400e}
+
+  .tabs{flex:none;display:flex;gap:6px;padding:4px 14px 10px;border-bottom:1px solid var(--line)}
+  .tabs button{flex:1;border:1px solid var(--line);background:#fff;border-radius:9px;padding:9px 4px;font-size:12.5px;font-weight:600;color:var(--muted);cursor:pointer}
+  .tabs button.on{background:var(--bg);color:#fff;border-color:var(--bg)}
+
+  .body{flex:1;overflow:auto;padding:12px 14px calc(20px + env(safe-area-inset-bottom));-webkit-overflow-scrolling:touch}
+  .tab{display:none}
+  .tab.on{display:block}
+
+  .sec{margin-bottom:18px}
+  .sec h2{font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--muted);margin:0 0 8px}
+
+  .scen{display:flex;flex-direction:column;gap:9px}
+  .scen button{text-align:left;border:1px solid var(--line);background:#fff;border-radius:13px;padding:13px 14px;font-size:13.5px;font-weight:600;cursor:pointer;line-height:1.3;box-shadow:0 1px 4px rgba(15,23,42,.07);transition:.12s}
+  .scen button .s{display:block;color:var(--muted);font-size:11.5px;font-weight:400;margin-top:4px}
+  .scen button.active{border-color:var(--green);background:#f0fdf4;box-shadow:0 2px 10px rgba(34,197,94,.18),inset 0 0 0 1px var(--green)}
+
+  .palette{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+  .palette button{border:1px solid var(--line);background:#fff;border-radius:13px;padding:14px 6px;cursor:pointer;font-size:15px;font-weight:800;box-shadow:0 1px 4px rgba(15,23,42,.07)}
+  .palette button small{display:block;font-weight:400;color:var(--muted);font-size:11px;margin-top:3px}
+
+  .row{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+  .row label{font-size:12.5px;color:var(--muted)}
+  .inseg{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
+  .inseg button{border:0;background:#fff;padding:9px 14px;font-size:13px;cursor:pointer}
+  .inseg button.on{background:var(--bg);color:#fff}
+  .roleSel{display:flex;gap:7px;margin-top:4px}
+  .roleSel button{flex:1;border:1px solid var(--line);background:#fff;border-radius:9px;padding:11px 4px;font-size:12.5px;font-weight:600;cursor:pointer}
+  .roleSel button.on[data-role="primary"]{background:var(--primary);border-color:var(--primary);color:#fff}
+  .roleSel button.on[data-role="adu"]{background:var(--adu);border-color:var(--adu);color:#fff}
+  .roleSel button.on[data-role="jadu"]{background:var(--jadu);border-color:var(--jadu);color:#fff}
+
+  .toggle{display:flex;align-items:center;gap:10px;font-size:13.5px;cursor:pointer;user-select:none}
+  .toggle input{width:42px;height:24px;appearance:none;-webkit-appearance:none;background:#cbd5e1;border-radius:999px;position:relative;cursor:pointer;transition:.15s;flex:none}
+  .toggle input:checked{background:var(--green)}
+  .toggle input::after{content:"";position:absolute;width:20px;height:20px;background:#fff;border-radius:50%;top:2px;left:2px;transition:.15s}
+  .toggle input:checked::after{left:20px}
+
+  .btn{width:100%;border:1px solid var(--line);background:#fff;border-radius:10px;padding:13px;font-size:13.5px;font-weight:600;cursor:pointer;margin-top:9px}
+  .btn.primary{background:var(--bg);color:#fff;border-color:var(--bg)}
+  .btn.danger{color:var(--red);border-color:#fecaca}
+  .foot{font-size:11.5px;color:var(--muted);margin-top:9px;line-height:1.55}
+
+  .metric{display:flex;justify-content:space-between;align-items:baseline;padding:11px 0;border-bottom:1px dashed var(--line);font-size:14px}
+  .metric .v{font-weight:700;font-size:16px}
+  .metric .v small{font-weight:400;color:var(--muted);font-size:11.5px}
+  .legend{font-size:12.5px;color:var(--muted);line-height:2}
+  .legend i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:7px;vertical-align:-1px}
+
+  #bmSeg{display:flex;flex-wrap:wrap;gap:7px}
+  #bmSeg button{border:1px solid var(--line);background:#fff;border-radius:9px;padding:9px 13px;font-size:12.5px;cursor:pointer}
+  #bmSeg button.on{background:var(--bg);color:#fff;border-color:var(--bg)}
+
+  .deskLink{display:inline-block;margin-top:6px;font-size:12px;color:var(--primary);text-decoration:none}
+</style>
+</head>
+<body>
+<div class="searchbar">
+  <span class="logo">Seek<b>ly</b></span>
+  <div class="field">
+    <span class="ico">⌂</span>
+    <select id="parcelSel"></select>
+  </div>
+  <span class="tag">MOCKUP</span>
+</div>
+
+<div id="map"></div>
+<div class="pill" id="pill"></div>
+<div class="hint" id="hint">Real satellite · setbacks &amp; GFA computed live. Tap a size, then drag the block.</div>
+
+<div class="mapctl">
+  <div class="seg" id="viewSeg"><button data-v="plan" class="on">2D</button><button data-v="iso">3D</button></div>
+  <button class="fab" id="delFab" title="Delete selected block">🗑</button>
+</div>
+
+<button class="viewToggle" id="viewToggle">⌗ Build</button>
+
+<div class="sheet" id="sheet">
+  <div class="grab" id="grabHandle"><span></span></div>
+  <div class="peek" id="peekBar"><div class="verdict ok" id="verdict">—</div></div>
+  <div class="tabs">
+    <button data-tab="build" class="on">Build</button>
+    <button data-tab="results">Results</button>
+    <button data-tab="map">Map</button>
+  </div>
+  <div class="body">
+    <!-- BUILD -->
+    <div class="tab on" id="tab-build">
+      <div class="sec"><h2>Scenario</h2><div class="scen" id="scenarios"></div></div>
+      <div class="sec"><h2>Existing house</h2>
+        <label class="toggle"><input type="checkbox" id="demoToggle"><span id="demoLbl">Keep house (build in backyard)</span></label>
+      </div>
+      <div class="sec"><h2>Place a building block</h2>
+        <div class="row"><label>Stories</label>
+          <div class="inseg" id="storySeg"><button data-st="1" class="on">1 story</button><button data-st="2">2 story</button></div>
+        </div>
+        <div class="roleSel" id="roleSel">
+          <button data-role="primary" class="on">Primary</button>
+          <button data-role="adu">ADU</button>
+          <button data-role="jadu">JADU</button>
+        </div>
+        <div style="height:10px"></div>
+        <div class="palette" id="palette"></div>
+        <button class="btn primary" id="autoBtn">⚡ Auto-place max units</button>
+        <button class="btn danger" id="clearBtn">Clear placed blocks</button>
+        <div class="foot">Tap a size to drop it in the green envelope, then <b>drag it on the map</b>. It turns red if it breaks a setback or hits the house. Tap a block then 🗑 to remove it.</div>
+      </div>
+    </div>
+    <!-- RESULTS -->
+    <div class="tab" id="tab-results">
+      <div class="sec"><h2>Live metrics</h2>
+        <div class="metric"><span>Units placed</span><span class="v" id="mUnits">0 <small>/ 0</small></span></div>
+        <div class="metric"><span>New GFA</span><span class="v" id="mGfa">0 <small>sf</small></span></div>
+        <div class="metric"><span>Total GFA</span><span class="v" id="mGfaTot">0 <small>sf</small></span></div>
+        <div class="metric"><span>FAR used</span><span class="v" id="mFar">0 <small>/ 0.50</small></span></div>
+        <div class="metric"><span>Lot coverage</span><span class="v" id="mCov">0 <small>%</small></span></div>
+        <div class="metric"><span>Envelope</span><span class="v" id="mEnv">0 <small>sf</small></span></div>
+        <div class="metric"><span>Envelope remaining</span><span class="v" id="mRem">0 <small>sf</small></span></div>
+      </div>
+      <div class="sec"><h2>Setbacks applied</h2><div id="sbInfo" class="legend"></div></div>
+      <div class="sec"><h2>Legend</h2>
+        <div class="legend">
+          <div><i style="background:rgba(34,197,94,.45);border:1px solid var(--green)"></i>Buildable envelope</div>
+          <div><i style="background:var(--primary)"></i>Primary dwelling</div>
+          <div><i style="background:var(--adu)"></i>ADU</div>
+          <div><i style="background:var(--jadu)"></i>JADU</div>
+        </div>
+      </div>
+    </div>
+    <!-- MAP -->
+    <div class="tab" id="tab-map">
+      <div class="sec"><h2>View</h2>
+        <div class="inseg" id="viewSeg2"><button data-v="plan" class="on">2D plan</button><button data-v="iso">3D massing</button></div>
+      </div>
+      <div class="sec"><h2>Basemap</h2>
+        <div id="bmSeg"></div>
+        <div class="foot">Google satellite, Google Hybrid (street labels), or a plain street Map.</div>
+      </div>
+      <div class="sec"><h2>About</h2>
+        <div class="foot">Real parcel from Seekly's 500-parcel sample; the existing house carves the buildable yard. Imagery © Google. No Rhino, no Grasshopper.
+        <br><a class="deskLink" href="index.html?desktop=1">↗ Open desktop version</a></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+/* ===== DATA: real parcels (EPSG:4326) ===== */
+const PARCELS=[
+ {ain:"2118023009",zone:"R1-1",addr:"18745 Cantlay St, Reseda 91335",lot_sf:7455,w:55.0,d:135.5,house_sf:2882,
+  ring:[[-118.542065461185,34.2025055835419],[-118.542064829722,34.2021331344821],[-118.542246727669,34.202132923854],[-118.542247359943,34.2025053729128]],
+  house:[[-118.542149,34.20234],[-118.542096,34.20234],[-118.542095,34.202194],[-118.542188,34.202193],[-118.542188,34.202224],[-118.542242,34.202224],[-118.542242,34.202292],[-118.54224,34.202292],[-118.542241,34.20241],[-118.542149,34.202411]]},
+ {ain:"2201015016",zone:"R1-1",addr:"17353 Willard St, Northridge 91325",lot_sf:5997,w:60.0,d:100.0,house_sf:1640,
+  ring:[[-118.511639503651,34.2188182021799],[-118.511837862601,34.2188154672281],[-118.511843472533,34.2190901637736],[-118.511645098775,34.2190929503177]],
+  house:[[-118.511664,34.218914],[-118.511702,34.218913],[-118.511701,34.21888],[-118.511835,34.218879],[-118.511836,34.218969],[-118.511716,34.21897],[-118.511716,34.218984],[-118.511665,34.218985]]},
+ {ain:"2163013007",zone:"R1-1",addr:"5432 Tampa Ave, Tarzana 91356",lot_sf:6981,w:50.0,d:139.6,house_sf:2428,
+  ring:[[-118.552908170108,34.1700745631363],[-118.552907889,34.1699371688119],[-118.553369466309,34.1699364589879],[-118.553369781236,34.1700738531599]],
+  house:[[-118.553285,34.170041],[-118.5531,34.170044],[-118.553099,34.170004],[-118.553,34.170006],[-118.552998,34.169947],[-118.553111,34.169944],[-118.553112,34.169978],[-118.553155,34.169977],[-118.553154,34.16995],[-118.553283,34.169948]]}
+];
+const SCENARIOS=[
+ {id:"city",name:"City zoning (R1 base)",sub:"front 20 · side 5 · rear 15",front:20,side:5,rear:15,cap:3,capNote:"1 primary + 1 ADU + 1 JADU"},
+ {id:"sb9",name:"SB9 — 2 units (no lot split)",sub:"front 20 · side 4 · rear 4",front:20,side:4,rear:4,cap:4,capNote:"2 primary + 1 ADU + 1 JADU"},
+ {id:"adu",name:"ADU / JADU focus",sub:"front 20 · side 4 · rear 4",front:20,side:4,rear:4,cap:3,capNote:"existing + 1 ADU + 1 JADU"}
+];
+const SIZES=[100,200,400,800], STORY_H_M=3.35, HOUSE_H_M=4.3, RFAR=0.50, FT2M=0.3048, K=364000;
+const BASEMAPS=[
+ {id:"google",name:"Google",max:21,attr:"Imagery © Google",tiles:["https://mt0.google.com/vt/lyrs=s&x={x}&y={y}&z={z}","https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}","https://mt2.google.com/vt/lyrs=s&x={x}&y={y}&z={z}"]},
+ {id:"googleHy",name:"Google Hybrid",max:21,attr:"Imagery © Google",tiles:["https://mt0.google.com/vt/lyrs=y&x={x}&y={y}&z={z}","https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}","https://mt2.google.com/vt/lyrs=y&x={x}&y={y}&z={z}"]},
+ {id:"map",name:"Map",max:21,attr:"Map data © Google",tiles:["https://mt0.google.com/vt/lyrs=m&x={x}&y={y}&z={z}","https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}","https://mt2.google.com/vt/lyrs=m&x={x}&y={y}&z={z}"]}
+];
+let activeBM="google";
+
+/* ===== STATE ===== */
+let P=null, scenario=SCENARIOS[1], demo=false, stories=1, role="primary", view="plan";
+let blocks=[], sel=null, grab=null, blockId=1, map=null, loaded=false;
+
+/* ===== GEOMETRY (local feet frame) ===== */
+function project(ring,lat0,lon0){const k=Math.cos(lat0*Math.PI/180);return ring.map(([lon,lat])=>[(lon-lon0)*K*k,(lat-lat0)*K]);}
+function centroid(r){let x=0,y=0;r.forEach(p=>{x+=p[0];y+=p[1]});return[x/r.length,y/r.length];}
+function rot(p,a){const c=Math.cos(a),s=Math.sin(a);return[p[0]*c-p[1]*s,p[0]*s+p[1]*c];}
+function rotAll(p,a){return p.map(q=>rot(q,a));}
+function bbox(p){const xs=p.map(q=>q[0]),ys=p.map(q=>q[1]);return{minx:Math.min(...xs),maxx:Math.max(...xs),miny:Math.min(...ys),maxy:Math.max(...ys)};}
+function polyArea(p){let a=0;for(let i=0;i<p.length;i++){const[x1,y1]=p[i],[x2,y2]=p[(i+1)%p.length];a+=x1*y2-x2*y1;}return Math.abs(a/2);}
+function pip(pt,poly){let c=false;for(let i=0,j=poly.length-1;i<poly.length;j=i++){const[xi,yi]=poly[i],[xj,yj]=poly[j];if(((yi>pt[1])!=(yj>pt[1]))&&(pt[0]<(xj-xi)*(pt[1]-yi)/(yj-yi)+xi))c=!c;}return c;}
+function segInt(a,b,c,d){function w(p,q,r){return(r[1]-p[1])*(q[0]-p[0])>(q[1]-p[1])*(r[0]-p[0]);}return w(a,c,d)!=w(b,c,d)&&w(a,b,c)!=w(a,b,d);}
+function polyOverlap(A,B){for(const p of A)if(pip(p,B))return true;for(const p of B)if(pip(p,A))return true;for(let i=0;i<A.length;i++)for(let j=0;j<B.length;j++)if(segInt(A[i],A[(i+1)%A.length],B[j],B[(j+1)%B.length]))return true;return false;}
+function blockCorners(b){const h=b.side/2;return[[b.cx-h,b.cy-h],[b.cx+h,b.cy-h],[b.cx+h,b.cy+h],[b.cx-h,b.cy+h]];}
+
+function buildModel(rec){
+  const[lon0,lat0]=centroid(rec.ring); const cosL=Math.cos(lat0*Math.PI/180);
+  let ring=project(rec.ring,lat0,lon0), house=project(rec.house,lat0,lon0);
+  let best=0,bi=0;
+  for(let i=0;i<ring.length;i++){const[x1,y1]=ring[i],[x2,y2]=ring[(i+1)%ring.length];const L=Math.hypot(x2-x1,y2-y1);if(L>best){best=L;bi=i;}}
+  const[ex1,ey1]=ring[bi],[ex2,ey2]=ring[(bi+1)%ring.length];
+  const a=(Math.PI/2)-Math.atan2(ey2-ey1,ex2-ex1);
+  ring=rotAll(ring,a); house=rotAll(house,a);
+  const b0=bbox(ring), cx=(b0.minx+b0.maxx)/2, cy=(b0.miny+b0.maxy)/2;
+  ring=ring.map(p=>[p[0]-cx,p[1]-cy]); house=house.map(p=>[p[0]-cx,p[1]-cy]);
+  const flip=centroid(house)[1]>0?-1:1;
+  if(flip<0){ring=ring.map(p=>[p[0],-p[1]]);house=house.map(p=>[p[0],-p[1]]);}
+  return {rec,ring,house,bb:bbox(ring),w:rec.w,d:rec.d,tf:{lon0,lat0,cosL,a,cx,cy,flip}};
+}
+function toLL(p){const t=P.tf;let y=p[1]*t.flip;const fr=rot([p[0]+t.cx,y+t.cy],-t.a);return[t.lon0+fr[0]/(K*t.cosL),t.lat0+fr[1]/K];}
+function toLocal(ll){const t=P.tf;const fx=(ll[0]-t.lon0)*K*t.cosL,fy=(ll[1]-t.lat0)*K;const r=rot([fx,fy],t.a);return[r[0]-t.cx,(r[1]-t.cy)*t.flip];}
+function ringLL(r){const o=r.map(toLL);o.push(o[0]);return o;}
+
+function envRect(){
+  const b=P.bb;
+  const x0=b.minx+scenario.side, x1=b.maxx-scenario.side;
+  let y0=b.miny+scenario.front, y1=b.maxy-scenario.rear;
+  if(!demo && P.house && P.house.length){
+    const ys=P.house.map(p=>p[1]);
+    const hy0=Math.min.apply(null,ys), hy1=Math.max.apply(null,ys);
+    const rearH=y1-Math.max(y0,hy1);
+    const frontH=Math.min(y1,hy0)-y0;
+    if(rearH>=frontH){ y0=Math.max(y0,hy1); } else { y1=Math.min(y1,hy0); }
+  }
+  return {x0,x1,y0,y1};
+}
+function envPoly(){const e=envRect();return[[e.x0,e.y0],[e.x1,e.y0],[e.x1,e.y1],[e.x0,e.y1]];}
+function inEnv(b){const e=envRect();for(const c of blockCorners(b))if(c[0]<e.x0-.05||c[0]>e.x1+.05||c[1]<e.y0-.05||c[1]>e.y1+.05)return false;return true;}
+function hitsHouse(b){return false;}
+function hitsOther(b){for(const o of blocks){if(o.id===b.id||o.role==="jadu"||b.role==="jadu")continue;if(polyOverlap(blockCorners(b),blockCorners(o)))return true;}return false;}
+function blockOk(b){return inEnv(b)&&!hitsHouse(b)&&!hitsOther(b);}
+function roleColor(r){return r==="adu"?"#f59e0b":r==="jadu"?"#a855f7":"#3b82f6";}
+
+/* ===== METRICS ===== */
+function compute(){
+  const ok=blocks.filter(blockOk);
+  const newGfa=ok.reduce((s,b)=>s+b.gfa,0);
+  const newFoot=ok.filter(b=>b.role!=="jadu").reduce((s,b)=>s+b.side*b.side,0);
+  const existGfa=demo?0:P.rec.house_sf, existFoot=demo?0:polyArea(P.house);
+  const totGfa=newGfa+existGfa, cov=(newFoot+existFoot)/P.rec.lot_sf*100, far=totGfa/P.rec.lot_sf;
+  const env=polyArea(envPoly()), rem=Math.max(0,env-newFoot-(demo?0:polyArea(P.house)));
+  const units=ok.length+(!demo&&scenario.id==="adu"?1:0);
+  return{ok,newGfa,totGfa,cov,far,env,rem,units,bad:blocks.length-ok.length};
+}
+
+/* ===== MAP SOURCES ===== */
+function feat(localRing,props){return{type:"Feature",properties:props||{},geometry:{type:"Polygon",coordinates:[ringLL(localRing)]}};}
+function updateSources(){
+  if(!loaded)return;
+  map.getSource("parcel").setData(feat(P.ring,{}));
+  map.getSource("env").setData(feat(envPoly(),{}));
+  map.getSource("house").setData({type:"FeatureCollection",features:[]});
+  const bf=blocks.map(b=>feat(blockCorners(b),{color:blockOk(b)?roleColor(b.role):"#ef4444",h:b.stories*STORY_H_M,sel:b===sel}));
+  map.getSource("blocks").setData({type:"FeatureCollection",features:bf});
+}
+
+/* ===== REFRESH PANEL ===== */
+function refresh(){
+  const m=compute();
+  document.getElementById("mUnits").innerHTML=m.units+' <small>/ '+scenario.cap+'</small>';
+  document.getElementById("mGfa").innerHTML=m.newGfa.toLocaleString()+' <small>sf</small>';
+  document.getElementById("mGfaTot").innerHTML=m.totGfa.toLocaleString()+' <small>sf</small>';
+  const far=document.getElementById("mFar");far.innerHTML=m.far.toFixed(2)+' <small>/ '+RFAR.toFixed(2)+'</small>';far.style.color=m.far>RFAR?"var(--amber)":"";
+  document.getElementById("mCov").innerHTML=m.cov.toFixed(0)+' <small>%</small>';
+  document.getElementById("mEnv").innerHTML=Math.round(m.env).toLocaleString()+' <small>sf</small>';
+  document.getElementById("mRem").innerHTML=Math.round(m.rem).toLocaleString()+' <small>sf</small>';
+  const v=document.getElementById("verdict");
+  if(m.bad>0){v.className="verdict warn";v.innerHTML="⚠ "+m.bad+" block"+(m.bad>1?"s":"")+" break a setback or hit the house. Drag into the green envelope.";}
+  else if(m.units>scenario.cap){v.className="verdict warn";v.innerHTML="⚠ "+m.units+" units exceeds the "+scenario.cap+"-unit cap ("+scenario.capNote+").";}
+  else if(m.units===0){v.className="verdict ok";v.innerHTML="Pick a block size to test what fits under <b>"+scenario.name+"</b>.";}
+  else{v.className="verdict ok";v.innerHTML="✓ "+m.units+" unit"+(m.units>1?"s":"")+" fit · "+m.newGfa.toLocaleString()+" sf new · "+m.totGfa.toLocaleString()+" sf total. Cap "+scenario.cap+" ("+scenario.capNote+").";}
+  document.getElementById("sbInfo").innerHTML="Front <b>"+scenario.front+"′</b> &nbsp; Side <b>"+scenario.side+"′</b> &nbsp; Rear <b>"+scenario.rear+"′</b><br><span style='color:#94a3b8'>"+(scenario.id==="city"?"Standard R1 yards (CP-7150 Table 1a).":"SB9 / state ADU cap side &amp; rear at 4′ (Gov Code 65852.21 / 66323).")+"</span>";
+  document.getElementById("pill").innerHTML="<b>"+P.rec.ain+"</b> · "+P.rec.zone+" · "+P.rec.lot_sf.toLocaleString()+" sf · "+P.rec.addr;
+  updateDelFab();
+  updateSources();
+}
+function updateDelFab(){document.getElementById("delFab").classList.toggle("show",!!sel);}
+
+/* ===== ACTIONS ===== */
+function addBlock(gfa){
+  const side=Math.sqrt(gfa/stories), e=envRect();
+  let cy=demo?(e.y0+e.y1)/2:e.y1-side/2-2, cx=(e.x0+e.x1)/2;
+  const b={id:blockId++,role,gfa,stories,side,cx,cy};
+  if(!blockOk(b)){const step=4;outer:for(let y=e.y1-side/2;y>=e.y0+side/2;y-=step)for(let x=e.x0+side/2;x<=e.x1-side/2;x+=step){b.cx=x;b.cy=y;if(blockOk(b))break outer;}}
+  blocks.push(b);sel=b;refresh();
+  flash("Block added — drag it on the map to position it.");
+}
+function autoPlace(){
+  const m=compute();let capLeft=scenario.cap-m.units;const gfa=400,st=stories,side=Math.sqrt(gfa/st),e=envRect(),gap=3;let n=0;
+  for(let y=e.y1-side/2;y>=e.y0+side/2&&capLeft>0;y-=(side+gap))for(let x=e.x0+side/2;x<=e.x1-side/2&&capLeft>0;x+=(side+gap)){
+    const b={id:blockId++,role:n===0&&scenario.id!=="city"?"primary":"adu",gfa,stories:st,side,cx:x,cy:y};
+    if(blockOk(b)){blocks.push(b);n++;capLeft--;}else blockId--;
+  }
+  sel=null;refresh();
+  flash(n?("Greedy grid-sweep placed "+n+" block"+(n>1?"s":"")+" — drag to refine."):"No room for more units under these setbacks.");
+}
+function loadParcel(i){
+  P=buildModel(PARCELS[i]);blocks=[];sel=null;
+  const lls=P.ring.map(toLL),xs=lls.map(p=>p[0]),ys=lls.map(p=>p[1]);
+  if(loaded){map.fitBounds([[Math.min(...xs),Math.min(...ys)],[Math.max(...xs),Math.max(...ys)]],{padding:fitPad(),pitch:view==="iso"?55:0,duration:600});}
+  refresh();
+}
+function setView(v){view=v;
+  document.querySelectorAll('[data-v]').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
+  map.easeTo({pitch:v==="iso"?55:0,bearing:v==="iso"?-18:0,duration:600});
+  flash(v==="iso"?"3D massing via fill-extrusion. Drag with one finger to orbit.":"Real satellite. Setbacks, envelope and GFA computed live.");
+}
+function fitPad(){return {top:120,bottom:Math.round(window.innerHeight*0.30),left:30,right:30};}
+
+let flashT=null;
+function flash(msg){const h=document.getElementById("hint");h.textContent=msg;h.style.opacity="1";clearTimeout(flashT);flashT=setTimeout(()=>h.style.opacity="0",3200);}
+
+/* ===== UI ===== */
+function buildUI(){
+  const ps=document.getElementById("parcelSel");
+  PARCELS.forEach((p,i)=>{const o=document.createElement("option");o.value=i;o.textContent=p.addr;ps.appendChild(o);});
+  ps.onchange=()=>loadParcel(+ps.value);
+  const sc=document.getElementById("scenarios");
+  SCENARIOS.forEach(s=>{const b=document.createElement("button");b.innerHTML=s.name+"<span class='s'>"+s.sub+"</span>";if(s===scenario)b.classList.add("active");b.onclick=()=>{scenario=s;[...sc.children].forEach(c=>c.classList.remove("active"));b.classList.add("active");refresh();};sc.appendChild(b);});
+  const pal=document.getElementById("palette");
+  SIZES.forEach(g=>{const b=document.createElement("button");b.innerHTML=g+" sf<small>GFA</small>";b.onclick=()=>addBlock(g);pal.appendChild(b);});
+  document.querySelectorAll("#storySeg button").forEach(b=>b.onclick=()=>{stories=+b.dataset.st;document.querySelectorAll("#storySeg button").forEach(x=>x.classList.remove("on"));b.classList.add("on");});
+  document.querySelectorAll("#roleSel button").forEach(b=>b.onclick=()=>{role=b.dataset.role;document.querySelectorAll("#roleSel button").forEach(x=>x.classList.remove("on"));b.classList.add("on");});
+  document.querySelectorAll("[data-v]").forEach(b=>b.onclick=()=>setView(b.dataset.v));
+  const dt=document.getElementById("demoToggle");
+  dt.onchange=()=>{demo=dt.checked;document.getElementById("demoLbl").textContent=demo?"Demolish house (full-lot redevelopment)":"Keep house (build in backyard)";refresh();};
+  document.getElementById("autoBtn").onclick=autoPlace;
+  document.getElementById("clearBtn").onclick=()=>{blocks=[];sel=null;refresh();};
+  document.getElementById("delFab").onclick=()=>{if(sel){blocks=blocks.filter(b=>b!==sel);sel=null;refresh();}};
+  const bmSeg=document.getElementById("bmSeg");
+  BASEMAPS.forEach(b=>{const x=document.createElement("button");x.textContent=b.name;if(b.id===activeBM)x.classList.add("on");x.onclick=()=>{activeBM=b.id;const s=map.getSource("sat");if(s&&s.setTiles)s.setTiles(b.tiles);[...bmSeg.children].forEach(c=>c.classList.remove("on"));x.classList.add("on");};bmSeg.appendChild(x);});
+
+  /* tabs */
+  document.querySelectorAll(".tabs button").forEach(b=>b.onclick=()=>{
+    document.querySelectorAll(".tabs button").forEach(x=>x.classList.remove("on"));b.classList.add("on");
+    document.querySelectorAll(".tab").forEach(t=>t.classList.remove("on"));
+    document.getElementById("tab-"+b.dataset.tab).classList.add("on");
+    if(curSnap==="peek")snapTo("half");
+  });
+  /* draggable bottom sheet with snap points */
+  initSheet();
+  document.getElementById("peekBar").onclick=()=>{if(curSnap==="peek")snapTo("half");};
+  document.getElementById("viewToggle").onclick=()=>snapTo(curSnap==="peek"?"half":"peek");
+}
+
+/* ===== BOTTOM SHEET (peek / half / full snap points) ===== */
+const sheetEl=document.getElementById("sheet");
+let curSnap="peek", lastY=0;
+function snapVals(){const h=sheetEl.offsetHeight||Math.round(window.innerHeight*0.9);
+  return {full:0, half:Math.max(0,h-Math.round(window.innerHeight*0.52)), peek:Math.max(0,h-120)};}
+function applyY(y){lastY=y;sheetEl.style.transform="translateY("+y+"px)";}
+function snapTo(name){const v=snapVals();curSnap=name;applyY(v[name]);updateChrome();}
+function updateChrome(){
+  const t=document.getElementById("viewToggle");
+  t.innerHTML=curSnap==="peek"?"⌗ Build":"🗺 Map";
+}
+function nearestSnap(y){const v=snapVals();let best="peek",bd=1e9;for(const k in v){const d=Math.abs(v[k]-y);if(d<bd){bd=d;best=k;}}return best;}
+function initSheet(){
+  const handles=[document.getElementById("grabHandle"),document.getElementById("peekBar")];
+  let startY=0,startTY=0,dragging=false,moved=false;
+  function down(e){dragging=true;moved=false;startY=(e.touches?e.touches[0].clientY:e.clientY);startTY=lastY;
+    sheetEl.classList.add("dragging");}
+  function move(e){if(!dragging)return;const y=(e.touches?e.touches[0].clientY:e.clientY);
+    const dy=y-startY;if(Math.abs(dy)>4)moved=true;
+    const v=snapVals();applyY(Math.max(0,Math.min(v.peek,startTY+dy)));
+    if(e.cancelable)e.preventDefault();}
+  function up(){if(!dragging)return;dragging=false;sheetEl.classList.remove("dragging");
+    if(moved){curSnap=nearestSnap(lastY);snapTo(curSnap);}}
+  handles.forEach(h=>{
+    h.addEventListener("touchstart",down,{passive:true});
+    h.addEventListener("touchmove",move,{passive:false});
+    h.addEventListener("touchend",up);
+    h.addEventListener("mousedown",e=>{down(e);const mm=ev=>move(ev),mu=()=>{up();window.removeEventListener("mousemove",mm);window.removeEventListener("mouseup",mu);};window.addEventListener("mousemove",mm);window.addEventListener("mouseup",mu);});
+  });
+  snapTo("peek");
+}
+
+/* ===== INIT MAP ===== */
+buildUI();
+P=buildModel(PARCELS[0]);
+const c0=centroid(PARCELS[0].ring);
+map=new maplibregl.Map({
+  container:"map",
+  style:{version:8,sources:{sat:{type:"raster",tiles:BASEMAPS[0].tiles,tileSize:256,maxzoom:20,attribution:BASEMAPS[0].attr}},layers:[{id:"sat",type:"raster",source:"sat"}]},
+  center:c0, zoom:18.2, pitch:0, bearing:0, maxPitch:70
+});
+map.addControl(new maplibregl.NavigationControl({visualizePitch:true,showCompass:true}),"bottom-right");
+map.on("load",()=>{
+  const empty={type:"FeatureCollection",features:[]};
+  map.addSource("parcel",{type:"geojson",data:empty});
+  map.addSource("env",{type:"geojson",data:empty});
+  map.addSource("house",{type:"geojson",data:empty});
+  map.addSource("blocks",{type:"geojson",data:empty});
+  map.addLayer({id:"env-fill",type:"fill",source:"env",paint:{"fill-color":"#22c55e","fill-opacity":0.22}});
+  map.addLayer({id:"env-line",type:"line",source:"env",paint:{"line-color":"#16a34a","line-width":2,"line-dasharray":[2,1.4]}});
+  map.addLayer({id:"parcel-line",type:"line",source:"parcel",paint:{"line-color":"#ffffff","line-width":2.5}});
+  map.addLayer({id:"house-3d",type:"fill-extrusion",source:"house",paint:{"fill-extrusion-color":"#64748b","fill-extrusion-height":HOUSE_H_M,"fill-extrusion-opacity":0.92}});
+  map.addLayer({id:"blocks-3d",type:"fill-extrusion",source:"blocks",paint:{"fill-extrusion-color":["get","color"],"fill-extrusion-height":["get","h"],"fill-extrusion-opacity":0.86}});
+  map.addLayer({id:"blocks-sel",type:"line",source:"blocks",filter:["==",["get","sel"],true],paint:{"line-color":"#ffffff","line-width":3}});
+  loaded=true;
+  const lls=P.ring.map(toLL),xs=lls.map(p=>p[0]),ys=lls.map(p=>p[1]);
+  map.fitBounds([[Math.min(...xs),Math.min(...ys)],[Math.max(...xs),Math.max(...ys)]],{padding:fitPad(),duration:0});
+  refresh();
+});
+
+/* ===== POINTER DRAG (mouse + touch) ===== */
+function pickAt(ll){const loc=toLocal(ll);for(let i=blocks.length-1;i>=0;i--)if(pip(loc,blockCorners(blocks[i])))return blocks[i];return null;}
+function startGrab(ll){
+  const loc=toLocal(ll);const hit=pickAt(ll);
+  if(hit){sel=hit;grab={dx:loc[0]-hit.cx,dy:loc[1]-hit.cy};map.dragPan.disable();map.getCanvas().style.cursor="grabbing";}
+  else{sel=null;}
+  updateDelFab();updateSources();
+  return !!hit;
+}
+function moveGrab(ll){if(!grab||!sel)return;const loc=toLocal(ll);sel.cx=loc[0]-grab.dx;sel.cy=loc[1]-grab.dy;refresh();}
+function endDrag(){if(grab){grab=null;map.dragPan.enable();map.getCanvas().style.cursor="";}}
+
+/* mouse (desktop fallback / hybrid) */
+map.on("mousedown",e=>{startGrab([e.lngLat.lng,e.lngLat.lat]);});
+map.on("mousemove",e=>{
+  if(!grab||!sel){const over=!!pickAt([e.lngLat.lng,e.lngLat.lat]);map.getCanvas().style.cursor=over?"grab":"";return;}
+  moveGrab([e.lngLat.lng,e.lngLat.lat]);
+});
+map.on("mouseup",endDrag);
+
+/* touch */
+map.on("touchstart",e=>{
+  if(!e.points||e.points.length!==1)return;           // 2+ fingers = let the map zoom/rotate
+  if(startGrab([e.lngLat.lng,e.lngLat.lat])&&e.originalEvent&&e.originalEvent.cancelable)e.originalEvent.preventDefault();
+});
+map.on("touchmove",e=>{
+  if(!grab||!sel)return;
+  if(e.originalEvent&&e.originalEvent.cancelable)e.originalEvent.preventDefault();
+  moveGrab([e.lngLat.lng,e.lngLat.lat]);
+});
+map.on("touchend",endDrag);
+map.on("touchcancel",endDrag);
+
+window.addEventListener("keydown",e=>{if((e.key==="Delete"||e.key==="Backspace")&&sel){blocks=blocks.filter(b=>b!==sel);sel=null;refresh();}});
+window.addEventListener("resize",()=>{if(map)map.resize();});
+</script>
+</body>
+</html>
