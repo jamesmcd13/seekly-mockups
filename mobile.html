@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Seekly · Buildable Feasibility (Mobile)</title>
 <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
 <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
@@ -43,9 +43,9 @@
     border-radius:18px 18px 0 0;box-shadow:0 -6px 24px rgba(15,23,42,.20);
     display:flex;flex-direction:column;max-height:82dvh;
     padding-bottom:env(safe-area-inset-bottom);transition:max-height .2s ease}
-  .grabber{display:flex;justify-content:center;align-items:center;padding:10px 0 6px;cursor:pointer;touch-action:none}
+  .grabber{display:flex;justify-content:center;align-items:center;width:100%;border:0;background:transparent;padding:10px 0 6px;cursor:pointer;touch-action:none}
   .grabber::before{content:"";width:42px;height:5px;border-radius:3px;background:#cbd5e1}
-  .peek{padding:0 14px 12px;cursor:pointer}
+  .peek{display:block;width:100%;border:0;background:transparent;text-align:left;font:inherit;color:inherit;padding:0 14px 12px;cursor:pointer}
   .peek .verdict{margin:0;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
   .sheet-tabs{display:none;gap:8px;padding:0 14px 10px}
   .sheet-tabs button{flex:1;border:1px solid var(--line);background:#fff;border-radius:9px;padding:10px;font-size:13.5px;font-weight:600;cursor:pointer}
@@ -117,8 +117,8 @@
 <div class="hint" id="hint">Real satellite. Tap a size to drop a block, then drag it on the map.</div>
 
 <div class="sheet open" id="sheet">
-  <div class="grabber" id="grabber"></div>
-  <div class="peek" id="peek"><div class="verdict ok" id="verdict">—</div></div>
+  <button class="grabber" id="grabber" type="button" aria-label="Toggle controls panel"></button>
+  <button class="peek" id="peek" type="button" aria-label="Toggle controls panel"><span class="verdict ok" id="verdict">—</span></button>
   <div class="sheet-tabs" id="sheetTabs">
     <button data-tab="build" class="on">Build</button>
     <button data-tab="results">Results</button>
