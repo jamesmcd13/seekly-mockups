@@ -1,118 +1,160 @@
 """
-Adapter that talks to the live Omnia backend.
+Read-only adapter to the Life-Omnia Neon Postgres DB.
 
-This is the ONLY file you have to wire to your real API. Everything the MCP
-server exposes flows through here, so the rest of the code stays clean.
+Wired to the REAL Omnia Lists schema (omnia_lists / omnia_tasks), confirmed from
+the omnia-lists-todos domain export. Tasks live here now — no Todoist.
 
-To finish wiring, fill in the three TODO areas below:
-  1. OMNIA_API_BASE_URL + OMNIA_API_TOKEN (via .env)
-  2. The auth header shape your API expects (Bearer? x-api-key?)
-  3. The real endpoint paths + how to read the JSON each one returns
+To run it you supply two things in .env (never in code/chat):
+  OMNIA_DB_DSN    postgresql://<readonly-user>:<pw>@<host>/<db>?sslmode=require
+  OMNIA_USER_ID   your Omnia user_id (RLS/tenant key; everything is scoped to it)
+
+Safety: use a READ-ONLY Neon role (SQL to create one is in the README). The
+connection also forces read-only transactions as a second guard.
 """
 
 from __future__ import annotations
 
 import os
-import httpx
+import asyncpg
 from dotenv import load_dotenv
 
-load_dotenv()  # read .env so OMNIA_API_BASE_URL / OMNIA_API_TOKEN are available
+load_dotenv()
+
+DSN = os.environ["OMNIA_DB_DSN"]
+USER_ID = os.environ["OMNIA_USER_ID"]
+
+_pool: asyncpg.Pool | None = None
 
 
-class OmniaClient:
-    def __init__(self) -> None:
-        # 1. CONFIG — set these in .env (see .env.example)
-        self.base_url = os.environ["OMNIA_API_BASE_URL"].rstrip("/")
-        self.token = os.environ["OMNIA_API_TOKEN"]
-
-    def _headers(self) -> dict[str, str]:
-        # 2. AUTH — adjust to whatever your API expects.
-        #    Bearer token shown; swap to {"x-api-key": self.token} if that's your scheme.
-        return {"Authorization": f"Bearer {self.token}", "Accept": "application/json"}
-
-    async def _get(self, path: str, params: dict | None = None) -> object:
-        async with httpx.AsyncClient(timeout=20.0) as http:
-            resp = await http.get(
-                f"{self.base_url}{path}", headers=self._headers(), params=params or {}
-            )
-            resp.raise_for_status()
-            return resp.json()
-
-    # 3. ENDPOINTS — each method below assumes a path + response shape.
-    #    Update the path strings and the formatting to match your real API.
-
-    async def get_tasks(
-        self, status: str = "active", context: str | None = None, due: str | None = None
-    ) -> str:
-        params = {"status": status}
-        if context:
-            params["context"] = context
-        if due:
-            params["due"] = due  # e.g. "today" | "week" | "overdue"
-        data = await self._get("/api/tasks", params)  # TODO: real path
-        return _format_tasks(data)
-
-    async def get_calendar(self, range: str = "week") -> str:
-        # range: "today" | "week" | "month" | ISO "2026-06-24..2026-06-30"
-        data = await self._get("/api/calendar", {"range": range})  # TODO: real path
-        return _format_calendar(data)
-
-    async def search_contexts(self, query: str | None = None) -> str:
-        params = {"q": query} if query else {}
-        data = await self._get("/api/contexts", params)  # TODO: real path
-        return _format_contexts(data)
-
-    async def get_messages(self, query: str | None = None, limit: int = 20) -> str:
-        params: dict = {"limit": limit}
-        if query:
-            params["q"] = query
-        data = await self._get("/api/messages", params)  # TODO: real path
-        return _format_messages(data)
+async def _get_pool() -> asyncpg.Pool:
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(
+            DSN,
+            min_size=1,
+            max_size=4,
+            # second guard on top of the read-only DB role
+            server_settings={"default_transaction_read_only": "on"},
+        )
+    return _pool
 
 
-# --- Formatters: turn raw JSON into compact, Claude-friendly markdown ---------
-# Keep output terse — this lands directly in the Claude Code context window.
-
-def _format_tasks(data: object) -> str:
-    items = data.get("tasks", data) if isinstance(data, dict) else data
-    if not items:
-        return "No tasks found for that filter."
-    lines = []
-    for t in items:
-        due = f" (due {t['due_date']})" if t.get("due_date") else ""
-        ctx = f" [{t['context']}]" if t.get("context") else ""
-        pri = f" !{t['priority']}" if t.get("priority") not in (None, "normal") else ""
-        lines.append(f"- {t.get('title', '(untitled)')}{ctx}{due}{pri}")
-    return "\n".join(lines)
+async def _rows(sql: str, *args) -> list[asyncpg.Record]:
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch(sql, *args)
 
 
-def _format_calendar(data: object) -> str:
-    items = data.get("events", data) if isinstance(data, dict) else data
-    if not items:
-        return "No calendar events in that range."
-    return "\n".join(
-        f"- {e.get('start', '?')}: {e.get('title', '(untitled)')}"
-        + (f" @ {e['location']}" if e.get("location") else "")
-        for e in items
+# --- Lists / Tasks (typed, real schema) --------------------------------------
+
+async def get_lists() -> str:
+    rows = await _rows(
+        """
+        SELECT name, kind, is_template, archived
+        FROM omnia_lists
+        WHERE user_id = $1 AND NOT archived
+        ORDER BY kind, name
+        """,
+        USER_ID,
     )
+    if not rows:
+        return "No Omnia lists found."
+    out = []
+    for r in rows:
+        tag = " [template]" if r["is_template"] else ""
+        out.append(f"- {r['name']} ({r['kind']}){tag}")
+    return "\n".join(out)
 
 
-def _format_contexts(data: object) -> str:
-    items = data.get("contexts", data) if isinstance(data, dict) else data
-    if not items:
-        return "No matching contexts/folders."
-    return "\n".join(
-        f"- {c.get('name', '(unnamed)')} ({c.get('kind', 'context')})"
-        + (f" — {c['open_task_count']} open" if c.get("open_task_count") is not None else "")
-        for c in items
+async def get_tasks(status: str = "open", list_name: str | None = None,
+                    due: str | None = None) -> str:
+    where = ["t.user_id = $1"]
+    args: list = [USER_ID]
+
+    # status: "open" (default) | "done" | "all"
+    if status == "open":
+        where.append("t.status <> 'done'")
+    elif status == "done":
+        where.append("t.status = 'done'")
+    # "all" -> no status filter
+
+    if due == "today":
+        where.append("t.due_date <= CURRENT_DATE")
+    elif due == "week":
+        where.append("t.due_date <= CURRENT_DATE + INTERVAL '7 days'")
+    elif due == "overdue":
+        where.append("t.due_date < CURRENT_DATE AND t.status <> 'done'")
+
+    if list_name:
+        args.append(f"%{list_name}%")
+        where.append(f"l.name ILIKE ${len(args)}")
+
+    sql = f"""
+        SELECT t.title, t.due_date, t.priority, t.status, t.rrule, l.name AS list
+        FROM omnia_tasks t
+        LEFT JOIN omnia_lists l ON l.id = t.list_id
+        WHERE {' AND '.join(where)}
+        ORDER BY t.due_date NULLS LAST, t.position
+        LIMIT 200
+    """
+    rows = await _rows(sql, *args)
+    if not rows:
+        return "No tasks match that filter."
+    out = []
+    for r in rows:
+        lst = f" [{r['list']}]" if r["list"] else ""
+        due_s = f" (due {r['due_date']})" if r["due_date"] else ""
+        pri = f" !P{r['priority']}" if r["priority"] not in (None, 0) else ""
+        rec = " ↻" if r["rrule"] else ""
+        done = " ✓" if r["status"] == "done" else ""
+        out.append(f"- {r['title']}{lst}{due_s}{pri}{rec}{done}")
+    return "\n".join(out)
+
+
+# --- Generic introspection (to extend to pipeline/contacts/etc. safely) ------
+
+async def list_tables() -> str:
+    rows = await _rows(
+        """
+        SELECT table_name
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+        ORDER BY table_name
+        """
     )
+    return "\n".join(f"- {r['table_name']}" for r in rows) or "(no tables)"
 
 
-def _format_messages(data: object) -> str:
-    items = data.get("messages", data) if isinstance(data, dict) else data
-    if not items:
-        return "No matching messages."
-    return "\n".join(
-        f"- {m.get('date', '?')} {m.get('from', '?')}: {m.get('snippet', m.get('body', ''))[:160]}"
-        for m in items
+async def describe_table(name: str) -> str:
+    rows = await _rows(
+        """
+        SELECT column_name, data_type
+        FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = $1
+        ORDER BY ordinal_position
+        """,
+        name,
     )
+    if not rows:
+        return f"No table named '{name}' in public schema."
+    return "\n".join(f"- {r['column_name']}: {r['data_type']}" for r in rows)
+
+
+async def run_select(sql: str) -> str:
+    """Run a read-only SELECT/WITH query. Rejects anything else."""
+    stripped = sql.strip().rstrip(";").lstrip()
+    head = stripped[:6].lower()
+    if not (head.startswith("select") or head.startswith("with")):
+        return "Only SELECT/WITH queries are allowed."
+    if ";" in stripped:
+        return "One statement only — remove the semicolon."
+    rows = await _rows(stripped)
+    if not rows:
+        return "(0 rows)"
+    cols = list(rows[0].keys())
+    out = [" | ".join(cols)]
+    for r in rows[:100]:
+        out.append(" | ".join("" if r[c] is None else str(r[c]) for c in cols))
+    if len(rows) > 100:
+        out.append(f"... ({len(rows)} rows, showing 100)")
+    return "\n".join(out)

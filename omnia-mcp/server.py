@@ -1,64 +1,66 @@
 """
-Omnia MCP server — exposes your live Omnia data to Claude Code as on-demand tools.
+Omnia MCP server — exposes your live Life-Omnia data to Claude Code, read-only.
 
-This is your OPERATOR tool: it loads your actual life/Omnia data (tasks, calendar,
-contexts, messages) so you can strategize in Claude Code with full context — and it
-deliberately knows NOTHING about the website's source code.
+Operator tool: pull your real Omnia data (tasks/lists now; pipeline/contacts via
+introspection) on demand for strategy work — separate from the website's code.
 
-Progressive disclosure: each tool pulls ONE slice on demand. Nothing is bulk-loaded.
+Tasks live in Omnia Lists (omnia_lists / omnia_tasks). No Todoist.
 
-Run:    python server.py        (stdio transport, which is what Claude Code uses)
-Wire:   see omnia_client.py for the API details to fill in.
+Run:  python server.py     (stdio transport — what Claude Code uses)
+Wire: see omnia_client.py + README (read-only Neon role + .env).
 """
 
 from mcp.server.fastmcp import FastMCP
-from omnia_client import OmniaClient
+import omnia_client as omnia
 
 mcp = FastMCP("omnia")
-omnia = OmniaClient()
 
 
 @mcp.tool()
-async def get_tasks(status: str = "active", context: str = "", due: str = "") -> str:
-    """Get the user's tasks. Pull only what's relevant — don't fetch everything.
-
-    Args:
-        status: "active" (default), "proposed", "done", or "all".
-        context: optional folder/context name to filter by (e.g. "Errands").
-        due: optional window — "today", "week", or "overdue".
-    """
-    return await omnia.get_tasks(status=status, context=context or None, due=due or None)
+async def get_lists() -> str:
+    """List the user's Omnia lists (To-do and Long Term), excluding archived."""
+    return await omnia.get_lists()
 
 
 @mcp.tool()
-async def get_calendar(range: str = "week") -> str:
-    """Get calendar events.
+async def get_tasks(status: str = "open", list_name: str = "", due: str = "") -> str:
+    """Get the user's Omnia tasks. Pull only what's relevant — not everything.
 
     Args:
-        range: "today", "week" (default), "month", or an ISO range "YYYY-MM-DD..YYYY-MM-DD".
+        status: "open" (default, not done), "done", or "all".
+        list_name: optional list name to filter by (partial match, e.g. "Main St").
+        due: optional — "today", "week", or "overdue".
     """
-    return await omnia.get_calendar(range=range)
+    return await omnia.get_tasks(status=status, list_name=list_name or None, due=due or None)
 
 
 @mcp.tool()
-async def search_contexts(query: str = "") -> str:
-    """List or search the user's contexts/folders (Work, a specific deal, etc.).
-
-    Args:
-        query: optional search text. Omit to list all contexts.
-    """
-    return await omnia.search_contexts(query=query or None)
+async def list_tables() -> str:
+    """List all tables in the Omnia DB (to discover pipeline/contacts/etc.)."""
+    return await omnia.list_tables()
 
 
 @mcp.tool()
-async def get_messages(query: str = "", limit: int = 20) -> str:
-    """Get recent or matching messages from the user's Omnia inbox.
+async def describe_table(name: str) -> str:
+    """Show a table's columns + types, so new typed tools can be added safely.
 
     Args:
-        query: optional search text. Omit for the most recent messages.
-        limit: max messages to return (default 20).
+        name: exact table name (from list_tables).
     """
-    return await omnia.get_messages(query=query or None, limit=limit)
+    return await omnia.describe_table(name)
+
+
+@mcp.tool()
+async def query(sql: str) -> str:
+    """Run a single read-only SELECT/WITH query against the Omnia DB.
+
+    Use for pipeline/contacts/messages until typed tools exist. SELECT only;
+    one statement; results capped at 100 rows. Always scope by your user_id.
+
+    Args:
+        sql: a single SELECT or WITH statement.
+    """
+    return await omnia.run_select(sql)
 
 
 if __name__ == "__main__":

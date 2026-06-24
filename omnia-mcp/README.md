@@ -1,62 +1,68 @@
 # Omnia MCP Server
 
-Exposes your **live Omnia data** (tasks, calendar, contexts, messages) to Claude Code
-as on-demand tools, so you can strategize about your real life/Omnia with full context.
+Exposes your **live Life-Omnia data** to Claude Code, **read-only**, so you can
+strategize over your real tasks/lists (and, via introspection, pipeline/contacts)
+on demand. Operator tool — separate from the website's source code.
 
-This is an **operator tool**. It reads your data only. It knows nothing about the
-website's source code — keep it separate from your code repos.
+Tasks live in **Omnia Lists** (`omnia_lists` / `omnia_tasks`). No Todoist.
 
-## What it gives you in Claude Code
+## Tools
 
-| Tool | What it pulls |
-|------|---------------|
-| `get_tasks(status, context, due)` | Your tasks, filtered — pulls one slice, not everything |
-| `get_calendar(range)` | Calendar events for today / week / month / a date range |
-| `search_contexts(query)` | Your folders/contexts (Work, a deal, etc.) |
-| `get_messages(query, limit)` | Recent or matching inbox messages |
+| Tool | What it does |
+|------|--------------|
+| `get_lists()` | Your Omnia lists (To-do / Long Term), excluding archived |
+| `get_tasks(status, list_name, due)` | Tasks, filtered — `status` open/done/all, `due` today/week/overdue |
+| `list_tables()` | All tables (to discover pipeline/contacts/messages/etc.) |
+| `describe_table(name)` | A table's columns + types |
+| `query(sql)` | A single read-only `SELECT`/`WITH` (capped 100 rows) for domains without typed tools yet |
 
-Each tool fetches **on demand** — nothing is bulk-loaded into context.
+## Go live (≈15 min)
 
-## Setup
+### 1. Create a read-only Neon role
+In the Neon SQL editor for the **Life Omnia** project (`ep-spring-firefly`):
 
+```sql
+CREATE ROLE omnia_readonly WITH LOGIN PASSWORD 'choose-a-strong-password';
+GRANT CONNECT ON DATABASE neondb TO omnia_readonly;
+GRANT USAGE ON SCHEMA public TO omnia_readonly;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO omnia_readonly;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO omnia_readonly;
+```
+
+This role can **only read** — it physically cannot write or delete.
+
+### 2. Configure `.env`
 ```bash
 cd omnia-mcp
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env        # then fill in your API base URL + token
+cp .env.example .env
 ```
+Edit `.env`:
+- `OMNIA_DB_DSN` — the pooled connection string for the `omnia_readonly` role (Neon dashboard → Connection Details → role = omnia_readonly, pooled).
+- `OMNIA_USER_ID` — your Omnia `user_id`. Find it with:
+  `SELECT id, email FROM users;` in the Neon SQL editor.
 
-## Wire it to your API
-
-Open `omnia_client.py` and fill in the 3 marked spots:
-1. `.env` → `OMNIA_API_BASE_URL` and `OMNIA_API_TOKEN`
-2. The auth header shape (`Authorization: Bearer …` vs `x-api-key`)
-3. The real endpoint paths + how to read each response
-
-That file is the only place tied to your real API.
-
-## Register it with Claude Code
-
+### 3. Register with Claude Code
 ```bash
 claude mcp add omnia -- python /absolute/path/to/omnia-mcp/server.py
 ```
-
-Or add to `.mcp.json`:
-
+Or in `.mcp.json`:
 ```json
-{
-  "mcpServers": {
-    "omnia": { "command": "python", "args": ["/absolute/path/to/omnia-mcp/server.py"] }
-  }
-}
+{ "mcpServers": { "omnia": { "command": "python", "args": ["/abs/path/omnia-mcp/server.py"] } } }
 ```
 
-Then in Claude Code the tools appear as `get_tasks`, `get_calendar`, etc. Your
-`/omnia` skill should tell Claude to load `me.md` and use these tools to pull
-specific context on demand — never to fetch everything up front.
+### 4. Test
+In Claude Code: *"what's on my plate this week?"* → `get_tasks(due="week")` pulls live tasks. **Live.**
 
-## Next steps
+## Extending to pipeline / contacts / messages
+Those tables exist in the same DB; we just haven't written typed tools yet.
+Use `list_tables()` + `describe_table('omnia_deals')` (etc.) to see the real
+columns, then add a typed tool in `omnia_client.py` + `server.py` the same way
+`get_tasks` is built. Until then, `query("SELECT ... WHERE user_id = '<id>'")`
+works read-only.
 
-- Add a one-page `me.md` (who you are, what Omnia is, current priorities).
-- Point the existing `/omnia` skill at this server.
-- Later: add **write** tools (`create_task`, `update_task`) if you want to act from Claude Code.
+## Notes
+- Everything is scoped to `OMNIA_USER_ID`. The read-only role + forced read-only
+  transactions are two independent write guards.
+- `.env` is gitignored. Don't commit it.
