@@ -533,7 +533,7 @@ async def add_shared_item(list_title: str, text: str, priority: int | None = Non
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT id, title FROM shared_lists WHERE workspace_id=$1 AND archived=false "
-            "AND title ILIKE $2 ESCAPE '\' ORDER BY created_at",
+            r"AND title ILIKE $2 ESCAPE '\' ORDER BY created_at",
             USER_ID, _like_arg(list_title.strip()),
         )
         exact = [r for r in rows if r["title"].lower() == list_title.strip().lower()]
@@ -730,6 +730,10 @@ async def planner_set_day(day: str, blocks) -> str:
                 list_id = await _planner_list_id(conn)
                 existing = {str(r["id"]): r for r in await _day_blocks(conn, d)}
                 keep: set = set()
+                # Deletes deferred to the end: a task dropped from block A may be
+                # claimed by a LATER block in the same payload.
+                claimed: list = []
+                kept_blocks: list = []
                 for b in blocks:
                     title = (b.get("title") or "").strip()
                     if not title:
@@ -742,7 +746,7 @@ async def planner_set_day(day: str, blocks) -> str:
                         "SELECT ($1::timestamptz AT TIME ZONE $2)::date = $3", s, PLANNER_TZ, d)
                     if not on_day:
                         raise ValueError(f"block '{title}' does not start on {d}")
-                    tags = _json.dumps([_proj(b.get("project"))])
+                    tags = _json.dumps([_proj(b.get("project"))]) if b.get("project") else None
                     bid = _uuid_or_none(b.get("id"))
                     found = None
                     if bid:
@@ -756,11 +760,12 @@ async def planner_set_day(day: str, blocks) -> str:
                             "text, note, tags, start_at, end_at, today_date, planner_status, "
                             "created_by, updated_by) VALUES ($1,$2,$3,true,$4,$5,$6::jsonb,$7,$8,$9,"
                             "'planned','james','james')",
-                            bid, list_id, PLANNER_WS, title, b.get("note"), tags, s, e, d)
+                            bid, list_id, PLANNER_WS, title, b.get("note"),
+                            tags or _json.dumps(["other"]), s, e, d)
                     else:
                         await conn.execute(
                             "UPDATE shared_list_items SET text=$3, note=COALESCE($4, note), "
-                            "tags=$5::jsonb, start_at=$6, end_at=$7, today_date=$8, "
+                            "tags=COALESCE($5::jsonb, tags), start_at=$6, end_at=$7, today_date=$8, "
                             "updated_by='james', updated_at=now() WHERE workspace_id=$1 AND id=$2",
                             PLANNER_WS, bid, title, b.get("note"), tags, s, e, d)
                     keep.add(str(bid))
@@ -769,7 +774,7 @@ async def planner_set_day(day: str, blocks) -> str:
                         text = (t.get("text") or "").strip()
                         if not text:
                             raise ValueError(f"block '{title}': empty task text")
-                        ttags = _json.dumps([_proj(t.get("project"))])
+                        ttags = _json.dumps([_proj(t.get("project"))]) if t.get("project") else None
                         rank = (i + 1) * _RANK_STEP
                         tid = _uuid_or_none(t.get("id"))
                         tfound = None
@@ -781,7 +786,8 @@ async def planner_set_day(day: str, blocks) -> str:
                         if tfound:
                             await conn.execute(
                                 "UPDATE shared_list_items SET parent_item_id=$3, text=$4, "
-                                "note=COALESCE($5, note), tags=$6::jsonb, rank=$7, today_date=$8, "
+                                "note=COALESCE($5, note), tags=COALESCE($6::jsonb, tags), rank=$7, "
+                                "today_date=$8, "
                                 "updated_by='james', updated_at=now() "
                                 "WHERE workspace_id=$1 AND id=$2",
                                 PLANNER_WS, tid, bid, text, t.get("note"), ttags, rank, d)
@@ -792,12 +798,15 @@ async def planner_set_day(day: str, blocks) -> str:
                                 "workspace_id, is_private, text, note, tags, rank, today_date, "
                                 "planner_status, created_by, updated_by) VALUES ($1,$2,$3,$4,true,"
                                 "$5,$6,$7::jsonb,$8,$9,'planned','james','james')",
-                                tid, list_id, bid, PLANNER_WS, text, t.get("note"), ttags, rank, d)
+                                tid, list_id, bid, PLANNER_WS, text, t.get("note"),
+                                ttags or _json.dumps(["other"]), rank, d)
                         wanted.append(tid)
-                    await conn.execute(
-                        "DELETE FROM shared_list_items WHERE workspace_id=$1 AND is_private "
-                        "AND parent_item_id=$2 AND NOT (id = ANY($3::uuid[]))",
-                        PLANNER_WS, bid, wanted)
+                    claimed.extend(wanted)
+                    kept_blocks.append(bid)
+                await conn.execute(
+                    "DELETE FROM shared_list_items WHERE workspace_id=$1 AND is_private "
+                    "AND parent_item_id = ANY($2::uuid[]) AND NOT (id = ANY($3::uuid[]))",
+                    PLANNER_WS, kept_blocks, claimed)
                 for key, r in existing.items():
                     if key not in keep:
                         if r["busy_event_id"]:
@@ -911,7 +920,8 @@ async def planner_snooze(task_id: str, to_block_id: str | None = None) -> str:
                     "ORDER BY start_at, created_at LIMIT 1",
                     PLANNER_WS, cur["id"], cur["start_at"], cur["today_date"], PLANNER_TZ)
             if target is None:
-                return "No later block today to snooze into."
+                return ("Target block not found." if to_block_id
+                        else "No later block today to snooze into.")
             rank = await conn.fetchval(
                 "SELECT COALESCE(MAX(rank), 0) + $3 FROM shared_list_items WHERE workspace_id=$1 "
                 "AND parent_item_id=$2 AND id<>$4", PLANNER_WS, target["id"], _RANK_STEP, t["id"])
