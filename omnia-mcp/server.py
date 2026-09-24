@@ -276,7 +276,8 @@ async def planner_set_day(date: str, blocks: list[dict]) -> str:
     """Create or REPLACE the whole private plan for one day. Blocks of that day
     not listed are deleted; a listed block's tasks not listed are deleted; the
     list order is the queue order. Pass ids (from planner_get_day) to keep rows
-    and their timers. Private: never visible to Michael.
+    and their timers. Private: never visible to Michael. Refused if it would drop
+    or re-time a Busy block: call planner_set_busy(id, False) first.
 
     Args:
         date: 'YYYY-MM-DD' (Pacific day).

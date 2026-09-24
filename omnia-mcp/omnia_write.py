@@ -713,16 +713,15 @@ async def _to_ts(conn, d: date, value):
 async def planner_set_day(day: str, blocks) -> str:
     """Create/replace the plan for one day. `blocks` = list of
     {id?, title, start, end, project?, note?, tasks: [{id?, text, project?, note?}]}
-    with start/end 'HH:MM' Pacific or ISO. Blocks that day not listed are deleted
-    (a dropped Busy block's Outlook event is NOT removed here; call
-    planner_set_busy(id, False) first)."""
+    with start/end 'HH:MM' Pacific or ISO. Blocks that day not listed are deleted.
+    A Busy block (it has an Outlook event) can be neither dropped nor re-timed
+    here: the call is refused until planner_set_busy(id, False) frees it."""
     try:
         d = _parse_day(day)
     except ValueError:
         return "date must be YYYY-MM-DD."
     if isinstance(blocks, str):
         blocks = _json.loads(blocks)
-    dropped_busy: list = []
     pool = await _get_pool()
     try:
         async with pool.acquire() as conn:
@@ -750,9 +749,16 @@ async def planner_set_day(day: str, blocks) -> str:
                     bid = _uuid_or_none(b.get("id"))
                     found = None
                     if bid:
-                        found = await conn.fetchval(
-                            "SELECT id FROM shared_list_items WHERE workspace_id=$1 AND is_private "
-                            "AND id=$2 AND parent_item_id IS NULL", PLANNER_WS, bid)
+                        cur_b = await conn.fetchrow(
+                            "SELECT id, start_at, end_at, busy_event_id FROM shared_list_items "
+                            "WHERE workspace_id=$1 AND is_private AND id=$2 AND parent_item_id IS NULL",
+                            PLANNER_WS, bid)
+                        found = cur_b["id"] if cur_b else None
+                        if cur_b and cur_b["busy_event_id"] and (
+                                cur_b["start_at"] != s or cur_b["end_at"] != e):
+                            raise ValueError(
+                                f"block '{title}' is Busy (has an Outlook event); call "
+                                f"planner_set_busy('{bid}', False) before re-timing it")
                     if found is None:
                         bid = uuid.uuid4()
                         await conn.execute(
@@ -807,19 +813,20 @@ async def planner_set_day(day: str, blocks) -> str:
                     "DELETE FROM shared_list_items WHERE workspace_id=$1 AND is_private "
                     "AND parent_item_id = ANY($2::uuid[]) AND NOT (id = ANY($3::uuid[]))",
                     PLANNER_WS, kept_blocks, claimed)
+                busy_dropped = [r["text"] for k, r in existing.items()
+                                if k not in keep and r["busy_event_id"]]
+                if busy_dropped:
+                    raise ValueError(
+                        "these blocks are Busy (have Outlook events): " + ", ".join(busy_dropped)
+                        + ". Call planner_set_busy(<id>, False) before dropping them")
                 for key, r in existing.items():
                     if key not in keep:
-                        if r["busy_event_id"]:
-                            dropped_busy.append(r["text"])
                         await conn.execute(
                             "DELETE FROM shared_list_items WHERE workspace_id=$1 AND is_private "
                             "AND id=$2", PLANNER_WS, r["id"])
                 out = await _day_json(conn, d)
     except ValueError as e:
         return f"Not saved: {e}"
-    if dropped_busy:
-        out["warning"] = ("Deleted Busy block(s) whose Outlook 'Focus block' events remain: "
-                          + ", ".join(dropped_busy))
     return _json.dumps(out, indent=1)
 
 
@@ -853,6 +860,8 @@ async def planner_start(task_id: str) -> str:
                 return "Planner task not found."
             if t["planner_status"] == "active":
                 return f"Already running: '{t['text']}'."
+            # Serialize concurrent starts (same key as the backend).
+            await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", f"{PLANNER_WS}:timers")
             active = await conn.fetchval(
                 "SELECT count(*) FROM shared_list_items WHERE workspace_id=$1 AND is_private "
                 "AND parent_item_id IS NOT NULL AND planner_status='active' AND id<>$2",
@@ -865,8 +874,8 @@ async def planner_start(task_id: str) -> str:
                 "updated_at=now() WHERE workspace_id=$1 AND id=$2", PLANNER_WS, t["id"])
             await conn.execute(
                 "UPDATE shared_list_items SET "
-                "planner_status=CASE WHEN COALESCE(planner_status,'planned')='planned' "
-                "THEN 'active' ELSE planner_status END, "
+                "planner_status=CASE WHEN COALESCE(planner_status,'planned') IN ('planned','done') "
+                "THEN 'active' ELSE planner_status END, done=false, done_at=NULL, "
                 "actual_start=COALESCE(actual_start, now()), actual_end=NULL, updated_at=now() "
                 "WHERE workspace_id=$1 AND id=$2", PLANNER_WS, t["parent_item_id"])
     return f"Started '{t['text']}'. [task {t['id']}]"
