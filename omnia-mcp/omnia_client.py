@@ -15,10 +15,13 @@ connection also forces read-only transactions as a second guard.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import asyncpg
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env from THIS file's folder, regardless of the process cwd (Claude Code
+# launches the MCP server from the project dir, not omnia-mcp/).
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 DSN = os.environ["OMNIA_DB_DSN"]
 USER_ID = os.environ["OMNIA_USER_ID"]
@@ -90,11 +93,12 @@ async def get_tasks(status: str = "open", list_name: str | None = None,
         where.append(f"l.name ILIKE ${len(args)}")
 
     sql = f"""
-        SELECT t.title, t.due_date, t.priority, t.status, t.rrule, l.name AS list
+        SELECT t.name AS title, t.due_date, t.priority, t.status, t.rrule, l.name AS list
         FROM omnia_tasks t
-        LEFT JOIN omnia_lists l ON l.id = t.list_id
+        LEFT JOIN omnia_lists l
+          ON l.id = t.list_id AND l.user_id = t.user_id
         WHERE {' AND '.join(where)}
-        ORDER BY t.due_date NULLS LAST, t.position
+        ORDER BY t.due_date NULLS LAST
         LIMIT 200
     """
     rows = await _rows(sql, *args)
@@ -108,6 +112,85 @@ async def get_tasks(status: str = "open", list_name: str | None = None,
         rec = " ↻" if r["rrule"] else ""
         done = " ✓" if r["status"] == "done" else ""
         out.append(f"- {r['title']}{lst}{due_s}{pri}{rec}{done}")
+    return "\n".join(out)
+
+
+# --- Events / Contacts (typed, real schema) ----------------------------------
+
+async def get_events(days_ahead: int = 7) -> str:
+    """Upcoming calendar events (omnia_events) from now to now+days_ahead,
+    soonest first. Scoped to this user_id, same as get_tasks."""
+    try:
+        days = int(days_ahead)
+    except (TypeError, ValueError):
+        days = 7
+    if days < 1:
+        days = 1
+    rows = await _rows(
+        """
+        SELECT name AS title, start_at, end_at, all_day, location, description
+        FROM omnia_events
+        WHERE user_id = $1
+          AND start_at >= now()
+          AND start_at < now() + make_interval(days => $2)
+        ORDER BY start_at
+        LIMIT 200
+        """,
+        USER_ID, days,
+    )
+    if not rows:
+        return f"No events in the next {days} day(s)."
+    out = []
+    for r in rows:
+        when = f"{r['start_at']}"
+        if r["end_at"]:
+            when += f" to {r['end_at']}"
+        if r["all_day"]:
+            when += " (all day)"
+        loc = f" @ {r['location']}" if r["location"] else ""
+        note = f" ({r['description']})" if r["description"] else ""
+        out.append(f"- {r['title']}: {when}{loc}{note}")
+    return "\n".join(out)
+
+
+async def get_contacts(query: str | None = None, limit: int = 20) -> str:
+    """Contacts (name, phone, email) for this user, excluding soft-deleted rows.
+    If `query` is given, case-insensitive contains-match on name/email/phone (the
+    LIKE metacharacters % and _ are escaped). Scoped to this user_id."""
+    try:
+        lim = int(limit)
+    except (TypeError, ValueError):
+        lim = 20
+    lim = max(1, min(lim, 200))
+    where = ["user_id = $1", "deleted_at IS NULL"]
+    args: list = [USER_ID]
+    q = (query or "").strip()
+    if q:
+        # Escape LIKE wildcards so e.g. "50%" or "a_b" match literally.
+        esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        args.append(f"%{esc}%")
+        i = len(args)
+        where.append(
+            f"(name ILIKE ${i} ESCAPE '\\' "
+            f"OR primary_email ILIKE ${i} ESCAPE '\\' "
+            f"OR phone ILIKE ${i} ESCAPE '\\')"
+        )
+    args.append(lim)
+    sql = f"""
+        SELECT name, phone, primary_email
+        FROM contacts
+        WHERE {' AND '.join(where)}
+        ORDER BY name NULLS LAST
+        LIMIT ${len(args)}
+    """
+    rows = await _rows(sql, *args)
+    if not rows:
+        return "No matching contacts." if q else "No contacts found."
+    out = []
+    for r in rows:
+        phone = f" | {r['phone']}" if r["phone"] else ""
+        email = f" | {r['primary_email']}" if r["primary_email"] else ""
+        out.append(f"- {r['name'] or '(no name)'}{phone}{email}")
     return "\n".join(out)
 
 

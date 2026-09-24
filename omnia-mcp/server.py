@@ -1,5 +1,9 @@
 """
-Omnia MCP server — exposes your live Life-Omnia data to Claude Code, read-only.
+Omnia MCP server — exposes your live Life-Omnia data to Claude Code.
+
+Reads (omnia_client) are strictly read-only. Writes (omnia_write) are narrow and
+gated: INSERT + a single scoped status-UPDATE only, no DELETE/DDL, scoped to
+user_id, and meant to run behind an agent "propose-then-push" confirmation.
 
 Operator tool: pull your real Omnia data (tasks/lists now; pipeline/contacts via
 introspection) on demand for strategy work — separate from the website's code.
@@ -12,6 +16,7 @@ Wire: see omnia_client.py + README (read-only Neon role + .env).
 
 from mcp.server.fastmcp import FastMCP
 import omnia_client as omnia
+import omnia_write as omniaw
 
 mcp = FastMCP("omnia")
 
@@ -32,6 +37,32 @@ async def get_tasks(status: str = "open", list_name: str = "", due: str = "") ->
         due: optional — "today", "week", or "overdue".
     """
     return await omnia.get_tasks(status=status, list_name=list_name or None, due=due or None)
+
+
+@mcp.tool()
+async def get_events(days_ahead: int = 7) -> str:
+    """Get the user's UPCOMING calendar events (read-only), from now through the
+    next `days_ahead` days, soonest first. Use for "what's on my schedule",
+    "what's tomorrow", etc.
+
+    Args:
+        days_ahead: how many days ahead to include (default 7).
+    """
+    return await omnia.get_events(days_ahead=days_ahead)
+
+
+@mcp.tool()
+async def get_contacts(query: str = "", limit: int = 20) -> str:
+    """Look up the user's contacts (read-only): returns name, phone, email.
+    Excludes soft-deleted contacts. Use for "find Sarah's number", "what's Bob's
+    email", etc.
+
+    Args:
+        query: optional search text; case-insensitive match on name/email/phone.
+               Omit to list contacts.
+        limit: max rows to return (default 20).
+    """
+    return await omnia.get_contacts(query=query or None, limit=limit)
 
 
 @mcp.tool()
@@ -61,6 +92,156 @@ async def query(sql: str) -> str:
         sql: a single SELECT or WITH statement.
     """
     return await omnia.run_select(sql)
+
+
+# --- WRITE tools (INSERT + safe status-UPDATE only; no DELETE/DDL) ------------
+# Behavioral contract for agents: PROPOSE the change to the user and get an
+# explicit OK BEFORE calling any of these, then verify with a get_tasks read-back.
+
+@mcp.tool()
+async def add_task(title: str, list_name: str, due_date: str = "",
+                   description: str = "") -> str:
+    """Add a to-do to an existing Omnia list. Propose-then-push: confirm with the
+    user first. Verify afterward with get_tasks.
+
+    Args:
+        title: the task text.
+        list_name: an existing list (exact or unique partial match; ambiguous names are rejected).
+        due_date: optional 'YYYY-MM-DD'.
+        description: optional longer note.
+    """
+    return await omniaw.add_task(title, list_name, due_date or None, description or None)
+
+
+@mcp.tool()
+async def add_todo(text: str, priority: int = 1) -> str:
+    """Add a to-do to the DEFAULT shared quick list (the 'Quick ToDo' shared list).
+    This is the default home for an unqualified "add a to-do" / "remind me to X" /
+    "put X on my list" when NO specific list is named. For a SPECIFIC named list
+    (Groceries, Hawaii, etc.) use add_task instead.
+
+    Adds are reversible, so no confirmation is needed — just add it.
+
+    Args:
+        text: the to-do text.
+        priority: 1..5, where 1 = P1 (highest). Defaults to 1 (P1).
+    """
+    return await omniaw.add_shared_todo(text, priority)
+
+
+@mcp.tool()
+async def complete_task(task_id: str) -> str:
+    """Mark an Omnia task done (sets status + logs a completion). Needs the task's
+    UUID. Propose-then-push: confirm with the user first.
+
+    Args:
+        task_id: the task UUID (query it via the `query` tool if you only have the title).
+    """
+    return await omniaw.complete_task(task_id)
+
+
+@mcp.tool()
+async def update_todo(kind: str, item_id: str, text: str = "", due_date: str = "",
+                      priority: int | None = None) -> str:
+    """Edit ONE existing to-do (rename / reschedule / re-prioritize). Only the
+    fields you pass change. Edits are reversible, so no confirmation is needed.
+
+    Args:
+        kind: 'task' for an Omnia task, 'shared' for a shared-list to-do.
+        item_id: the row UUID (find it with the `query` tool by matching text first).
+        text: new text/title (optional).
+        due_date: new due date 'YYYY-MM-DD' (optional).
+        priority: new priority 1..5, 1=P1 (optional).
+    """
+    return await omniaw.update_todo(kind, item_id, text or None, due_date or None, priority)
+
+
+@mcp.tool()
+async def delete_todo(kind: str, item_id: str) -> str:
+    """DELETE ONE to-do. DESTRUCTIVE: only call after the user has confirmed the
+    exact target with the literal word DELETE. Reversible via DB point-in-time
+    restore, but do not call speculatively.
+
+    Args:
+        kind: 'task' for an Omnia task, 'shared' for a shared-list to-do.
+        item_id: the row UUID (resolve + echo the exact item to the user first).
+    """
+    return await omniaw.delete_todo(kind, item_id)
+
+
+@mcp.tool()
+async def update_contact(contact_id: str, name: str = "", phone: str = "",
+                         email: str = "", company: str = "", notes: str = "") -> str:
+    """Edit ONE existing contact. Only the fields you pass change. Reversible; no
+    confirmation needed.
+
+    Args:
+        contact_id: the contact UUID (find it with the `query` tool first).
+        name/phone/email/company/notes: new values (pass only what changes).
+    """
+    return await omniaw.update_contact(contact_id, name or None, phone or None,
+                                       email or None, company or None, notes or None)
+
+
+@mcp.tool()
+async def delete_contact(contact_id: str) -> str:
+    """SOFT-DELETE ONE contact (recoverable; sets deleted_at). DESTRUCTIVE-ish:
+    only call after the user confirmed the exact contact with the word DELETE.
+
+    Args:
+        contact_id: the contact UUID (resolve + echo the exact contact first).
+    """
+    return await omniaw.soft_delete_contact(contact_id)
+
+
+@mcp.tool()
+async def create_event(title: str, start_at: str, end_at: str = "",
+                       all_day: bool = False, location: str = "",
+                       description: str = "") -> str:
+    """DEPRECATED: Omnia calendar events sync from Outlook/Google and cannot be
+    created locally, so this tool does NOT create anything — it returns a message
+    telling you to add the appointment to the user's Outlook or Google calendar
+    (via the ms365 / gcal tools), which then syncs into Omnia. Args kept for
+    signature stability.
+
+    Args:
+        title: event name.
+        start_at: ISO timestamp, e.g. '2026-08-12T10:00:00-07:00'.
+        end_at: optional ISO end timestamp.
+        all_day: true for an all-day event.
+        location: optional.
+        description: optional.
+    """
+    return await omniaw.create_event(title, start_at, end_at or None, all_day,
+                                     location or None, description or None)
+
+
+@mcp.tool()
+async def add_contact(name: str, email: str = "", phone: str = "",
+                      company: str = "", notes: str = "") -> str:
+    """Add a contact to Omnia (skips exact-email duplicates). Propose-then-push:
+    confirm with the user first. Note: no birthday column — put dates in notes.
+
+    Args:
+        name: full name.
+        email: optional primary email.
+        phone: optional.
+        company: optional.
+        notes: optional free text (birthdays, how you know them, etc.).
+    """
+    return await omniaw.add_contact(name, email or None, phone or None,
+                                    company or None, notes or None)
+
+
+@mcp.tool()
+async def add_list(name: str, kind: str = "todo") -> str:
+    """Create a new Omnia list (skips duplicates). Propose-then-push: confirm first.
+
+    Args:
+        name: list name.
+        kind: 'todo' (default) or 'longterm'.
+    """
+    return await omniaw.add_list(name, kind)
 
 
 if __name__ == "__main__":
