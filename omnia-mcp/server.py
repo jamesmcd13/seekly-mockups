@@ -244,5 +244,97 @@ async def add_list(name: str, kind: str = "todo") -> str:
     return await omniaw.add_list(name, kind)
 
 
+
+@mcp.tool()
+async def add_shared_item(list_title: str, text: str, priority: int | None = None,
+                          due_date: str = "") -> str:
+    """Add an item to a NAMED shared list (e.g. 'CoBuyLA', 'Construction').
+    Michael can see shared lists. For the default quick list use add_todo.
+
+    Args:
+        list_title: the shared list's title (exact, or a unique partial match).
+        text: the item text.
+        priority: optional 1..5 (1 = P1, highest).
+        due_date: optional 'YYYY-MM-DD'.
+    """
+    return await omniaw.add_shared_item(list_title, text, priority, due_date or None)
+
+
+@mcp.tool()
+async def planner_get_day(date: str) -> str:
+    """James's PRIVATE planner for one day: time blocks (start/end, project,
+    status, Busy flag) each with an ordered task queue and timers. JSON.
+
+    Args:
+        date: 'YYYY-MM-DD' (Pacific day).
+    """
+    return await omniaw.planner_get_day(date)
+
+
+@mcp.tool()
+async def planner_set_day(date: str, blocks: list[dict]) -> str:
+    """Create or REPLACE the whole private plan for one day. Blocks of that day
+    not listed are deleted; a listed block's tasks not listed are deleted; the
+    list order is the queue order. Pass ids (from planner_get_day) to keep rows
+    and their timers. Private: never visible to Michael.
+
+    Args:
+        date: 'YYYY-MM-DD' (Pacific day).
+        blocks: [{"id"?: str, "title": str, "start": "HH:MM" | ISO, "end": "HH:MM" | ISO,
+                  "project"?: seekly|omnia|ccre|cobuy|18th|michael|personal|other,
+                  "note"?: str,
+                  "tasks": [{"id"?: str, "text": str, "project"?: str, "note"?: str}]}]
+    """
+    return await omniaw.planner_set_day(date, blocks)
+
+
+@mcp.tool()
+async def planner_start(task_id: str) -> str:
+    """Start the timer on one planner task (max 2 running at once).
+
+    Args:
+        task_id: the task UUID from planner_get_day.
+    """
+    return await omniaw.planner_start(task_id)
+
+
+@mcp.tool()
+async def planner_stop(task_id: str, accomplished: bool = False, note: str = "") -> str:
+    """Stop a planner task's timer. accomplished=true marks it done; false pauses
+    it (back to planned). When every task in a block is done the block is done.
+
+    Args:
+        task_id: the task UUID.
+        accomplished: true = done, false = paused.
+        note: optional note to store on the task (replaces the old note).
+    """
+    return await omniaw.planner_stop(task_id, accomplished, note or None)
+
+
+@mcp.tool()
+async def planner_snooze(task_id: str, to_block_id: str = "") -> str:
+    """Move a planner task to the END of the next block that day (or to
+    to_block_id). A running timer is stopped.
+
+    Args:
+        task_id: the task UUID.
+        to_block_id: optional target block UUID.
+    """
+    return await omniaw.planner_snooze(task_id, to_block_id or None)
+
+
+@mcp.tool()
+async def planner_set_busy(block_id: str, busy: bool) -> str:
+    """Show one planner block to others as Busy (creates ONE Outlook event
+    "Focus block" on James's CCRE calendar, never the task names) or make it
+    private again (deletes only that event). Goes through the Omnia backend.
+
+    Args:
+        block_id: the block UUID.
+        busy: true = Busy, false = private.
+    """
+    return await omniaw.planner_set_busy(block_id, busy)
+
+
 if __name__ == "__main__":
     mcp.run()
