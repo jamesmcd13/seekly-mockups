@@ -4,6 +4,35 @@ Newest first.
 
 ---
 
+## 2026-09-25: zoneinfo has no tzdata in the MCP venv; DSN normalizer could emit "?&sslmode"
+
+**Symptom:** while adding `pin_today` (planner follow-ups), importing
+`omnia_write` under the MCP's own venv raised
+`ZoneInfoNotFoundError: 'No time zone found with key America/Los_Angeles'`.
+Separately, a Neon branch DSN of the form `?channel_binding=require&sslmode=require`
+normalized to `?&sslmode=require`, which asyncpg rejects (`bad query field: ''`).
+
+**Context:** caught on the Neon-branch check before shipping; prod never saw
+either. The live server would have died at import (a module-level `ZoneInfo`).
+
+**Root cause:** (1) Windows Python ships no IANA tz database; `zoneinfo` needs
+the `tzdata` package, which the venv does not have. (2) `_normalize_dsn` removed
+`channel_binding=...` with a regex that left the separator behind when it was
+the FIRST query field (same bug class as backend B2, 2026-09-25).
+
+**Fix:** today-in-Pacific is computed by Postgres
+(`(now() AT TIME ZONE 'America/Los_Angeles')::date`), no `zoneinfo` import.
+`_normalize_dsn` rebuilds the query with `urlsplit`/`parse_qsl`/`urlencode`
+(verified: the prod DSN normalizes to the same string as before).
+
+**Prevention:** never use `zoneinfo` in omnia-mcp without adding `tzdata` to
+requirements; import-test every change with `.venv/Scripts/python.exe`, not the
+system Python.
+
+**Tags:** #omnia-mcp #windows #timezone #dsn #asyncpg
+
+---
+
 ## 2026-09-01 — Omnia MCP write tools couldn't create tasks-with-dates or events
 
 **Symptom:** `add_task` with a `due_date` and `create_event` both 500'd. Errors:

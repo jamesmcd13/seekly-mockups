@@ -246,24 +246,59 @@ async def add_list(name: str, kind: str = "todo") -> str:
 
 
 @mcp.tool()
-async def add_shared_item(list_title: str, text: str, priority: int | None = None,
-                          due_date: str = "") -> str:
-    """Add an item to a NAMED shared list (e.g. 'CoBuyLA', 'Construction').
-    Michael can see shared lists. For the default quick list use add_todo.
+async def get_shared_lists(query: str = "") -> str:
+    """List the user's SHARED lists (the /shared-lists page, 'james' workspace):
+    id, title, project, open item count. Also returns `today_list_id` (the list
+    titled "Today") and `quick_todo_list_id` (the Quick ToDo default list), so
+    you can target them by id with add_shared_item(list_id=...). JSON.
 
     Args:
-        list_title: the shared list's title (exact, or a unique partial match).
-        text: the item text.
+        query: optional case-insensitive title filter.
+    """
+    return await omniaw.get_shared_lists(query or None)
+
+
+@mcp.tool()
+async def add_shared_item(list_title: str = "", text: str = "", priority: int | None = None,
+                          due_date: str = "", list_id: str = "",
+                          pin_today: bool = False) -> str:
+    """Add an item to a shared list, by `list_id` (exact, from get_shared_lists)
+    or `list_title` (exact, or a unique partial match). Michael can see shared
+    lists. For the default quick list you can also use add_todo.
+
+    Args:
+        list_title: the shared list's title (used when list_id is empty).
+        text: the item text (required).
         priority: optional 1..5 (1 = P1, highest).
         due_date: optional 'YYYY-MM-DD'.
+        list_id: optional list UUID; wins over list_title.
+        pin_today: true = also pin the new item to Today (the /shared-lists
+            TODAY band: today_pinned, today_date = today in Pacific, appended
+            at the end of Today's order).
     """
-    return await omniaw.add_shared_item(list_title, text, priority, due_date or None)
+    return await omniaw.add_shared_item(list_title, text, priority, due_date or None,
+                                        list_id or None, pin_today)
+
+
+@mcp.tool()
+async def pin_shared_item_today(item_id: str, pin: bool = True) -> str:
+    """Pin an EXISTING shared-list item to Today (or unpin it with pin=false).
+    The item stays in its own list; it just shows in the TODAY band, tagged.
+
+    Args:
+        item_id: the shared item UUID (find it with the `query` tool).
+        pin: true = pin to Today (default), false = unpin.
+    """
+    return await omniaw.pin_shared_item_today(item_id, pin)
 
 
 @mcp.tool()
 async def planner_get_day(date: str) -> str:
     """James's PRIVATE planner for one day: time blocks (start/end, project,
-    status, Busy flag) each with an ordered task queue and timers. JSON.
+    status, Busy flag, lanes 1|2 + lane_names, checkin_at) each with ONE shared
+    ordered task queue; each task has lane (A/B in a 2-lane block), status,
+    actual_seconds (sum of timer runs, pauses excluded), running_since and
+    source_item_id. JSON.
 
     Args:
         date: 'YYYY-MM-DD' (Pacific day).
@@ -275,23 +310,49 @@ async def planner_get_day(date: str) -> str:
 async def planner_set_day(date: str, blocks: list[dict]) -> str:
     """Create or REPLACE the whole private plan for one day. Blocks of that day
     not listed are deleted; a listed block's tasks not listed are deleted; the
-    list order is the queue order. Pass ids (from planner_get_day) to keep rows
-    and their timers. Private: never visible to Michael. Refused if it would drop
-    or re-time a Busy block: call planner_set_busy(id, False) first.
+    list order is the shared queue order. Pass ids (from planner_get_day) to keep
+    rows and their timers. Private: never visible to Michael. Refused if it would
+    drop or re-time a Busy block: call planner_set_busy(id, False) first.
+
+    Two lanes: set "lanes": 2 (and optionally "lane_names": ["Urgent", "Omnia"])
+    on the block and "lane": "A"|"B" on each task. Do NOT put "A: "/"B: " in
+    task text; if you do, it is read as the lane and stripped. Omitting lanes
+    keeps a block's stored lanes.
 
     Args:
         date: 'YYYY-MM-DD' (Pacific day).
         blocks: [{"id"?: str, "title": str, "start": "HH:MM" | ISO, "end": "HH:MM" | ISO,
                   "project"?: seekly|omnia|ccre|cobuy|18th|michael|personal|other,
-                  "note"?: str,
-                  "tasks": [{"id"?: str, "text": str, "project"?: str, "note"?: str}]}]
+                  "note"?: str, "lanes"?: 1 | 2, "lane_names"?: [str, str],
+                  "tasks": [{"id"?: str, "text": str, "lane"?: "A" | "B",
+                             "project"?: str, "note"?: str}]}]
     """
     return await omniaw.planner_set_day(date, blocks)
 
 
 @mcp.tool()
+async def planner_add_task(block_id: str, text: str, lane: str = "", project: str = "",
+                           note: str = "", position: int | None = None,
+                           source_item_id: str = "") -> str:
+    """Add ONE task to a planner block (same as the app's "+ task" / Plan it).
+
+    Args:
+        block_id: the block UUID from planner_get_day.
+        text: the task text (no "A: "/"B: " prefix; use `lane`).
+        lane: 'A' or 'B' for a 2-lane block (default A; ignored for 1-lane).
+        project: optional project tag (default other).
+        note: optional note.
+        position: 0-based slot in the block's shared order (default end).
+        source_item_id: optional shared-list item this task is planned from:
+            it gets pinned to Today and is checked off when the task is done.
+    """
+    return await omniaw.planner_add_task(block_id, text, lane or None, project or None,
+                                         note or None, position, source_item_id or None)
+
+
+@mcp.tool()
 async def planner_start(task_id: str) -> str:
-    """Start the timer on one planner task (max 2 running at once).
+    """Start the timer on one planner task (opens a timer run; max 2 running at once).
 
     Args:
         task_id: the task UUID from planner_get_day.
@@ -301,8 +362,10 @@ async def planner_start(task_id: str) -> str:
 
 @mcp.tool()
 async def planner_stop(task_id: str, accomplished: bool = False, note: str = "") -> str:
-    """Stop a planner task's timer. accomplished=true marks it done; false pauses
-    it (back to planned). When every task in a block is done the block is done.
+    """Stop a planner task's timer (closes its timer run). accomplished=true marks
+    it done and also checks off the shared-list item it was planned from
+    (source_item_id); false pauses it (back to planned). When every task in a
+    block is done the block is done.
 
     Args:
         task_id: the task UUID.

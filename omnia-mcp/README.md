@@ -15,6 +15,10 @@ Tasks live in **Omnia Lists** (`omnia_lists` / `omnia_tasks`). No Todoist.
 | `list_tables()` | All tables (to discover pipeline/contacts/messages/etc.) |
 | `describe_table(name)` | A table's columns + types |
 | `query(sql)` | A single read-only `SELECT`/`WITH` (capped 100 rows) for domains without typed tools yet |
+| `get_shared_lists(query)` | Shared Lists (id, title, project, open count) + `today_list_id` / `quick_todo_list_id` |
+| `add_shared_item(list_title, text, priority, due_date, list_id, pin_today)` | Add to a shared list by id or title; `pin_today` puts it in the TODAY band |
+| `pin_shared_item_today(item_id, pin)` | Pin / unpin an existing shared item to Today |
+| `planner_get_day` / `planner_set_day` / `planner_add_task` / `planner_start` / `planner_stop` / `planner_snooze` / `planner_set_busy` | James's private planner (`james:private`): lanes A/B, timer runs, source-item done-sync. Mirrors omnia-platform `services/planner*.py` |
 
 ## Go live (≈15 min)
 
