@@ -439,26 +439,28 @@ async def complete_task(task_id: str) -> str:
     return f"Completed '{row['name']}'."
 
 
+class CalendarCreateNotAvailable(RuntimeError):
+    """create_event does NOT create anything. Raised (never returned as prose) so
+    no caller can mistake the refusal for a success-shaped result."""
+
+
 async def create_event(title: str, start_at: str, end_at: str | None = None,
                        all_day: bool = False, location: str | None = None,
                        description: str | None = None) -> str:
-    if not title.strip():
-        return "Event title is empty."
-    try:
-        datetime.fromisoformat(start_at.strip())
-        if end_at:
-            datetime.fromisoformat(end_at.strip())
-    except ValueError as e:
-        return f"Bad timestamp (use ISO 8601, e.g. 2026-08-12T10:00:00-07:00): {e}"
-    # omnia_events is a read-model of externally-synced calendars: a CHECK
-    # constraint restricts calendar_provider to 'google'/'outlook', and
-    # calendar_id/end_at are NOT NULL. A local-only event cannot be inserted, so
-    # do NOT fabricate one here. Real appointments must be created on the user's
-    # Outlook/Google calendar (via the ms365 / gcal tools), which then syncs into
-    # Omnia. See DEBUGLOG 2026-09-01.
-    return ("Omnia calendar events sync from Outlook/Google and can't be created "
-            "locally. Add the appointment to your Outlook or Google calendar "
-            "instead; it will then appear in Omnia.")
+    # RAISES, always (text-brain v2, 2026-09-25). It used to RETURN a normal
+    # string on refusal, so a model reading "the tool result" could (and did,
+    # audit 2026-09-25) narrate success. A refusal must be an error.
+    #
+    # Why nothing is written here: inserting omnia_events rows directly over
+    # asyncpg is wrong (CHECK / NOT NULL failures, and no provider push). The
+    # real path is the backend's HTTP POST /v1/events, which inserts the row AND
+    # pushes it to Outlook/Google via calendar_writer; the text-brain gets that in
+    # Phase 3 (needs the Phase 2 service token). See DEBUGLOG 2026-09-01 and
+    # omnia-gv-command/_AUDIT_textbrain_2026_09_25.md.
+    raise CalendarCreateNotAvailable(
+        "create_event is not available: nothing was created. Omnia events are "
+        "created through the backend POST /v1/events (not wired to this server yet). "
+        "Create the appointment on the Outlook or Google calendar instead.")
 
 
 async def add_contact(name: str, email: str | None = None, phone: str | None = None,

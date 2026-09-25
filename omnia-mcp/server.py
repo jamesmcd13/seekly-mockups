@@ -198,11 +198,11 @@ async def delete_contact(contact_id: str) -> str:
 async def create_event(title: str, start_at: str, end_at: str = "",
                        all_day: bool = False, location: str = "",
                        description: str = "") -> str:
-    """DEPRECATED: Omnia calendar events sync from Outlook/Google and cannot be
-    created locally, so this tool does NOT create anything — it returns a message
-    telling you to add the appointment to the user's Outlook or Google calendar
-    (via the ms365 / gcal tools), which then syncs into Omnia. Args kept for
-    signature stability.
+    """NOT AVAILABLE: this tool creates NOTHING and always returns an ERROR (it
+    raises; FastMCP turns that into an isError tool result, the server keeps
+    running). Create appointments on the user's Outlook or Google calendar (the
+    ms365 / gcal tools). Omnia-side creation goes through the backend
+    POST /v1/events in a later update. Args kept for signature stability.
 
     Args:
         title: event name.
