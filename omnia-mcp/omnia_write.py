@@ -25,6 +25,7 @@ Creds (never in code/chat):
 
 from __future__ import annotations
 
+import asyncio
 import json as _json
 import os
 import re
@@ -89,12 +90,17 @@ def _rw_dsn() -> str:
 
 
 _pool: asyncpg.Pool | None = None
+_pool_loop = None
 
 
 async def _get_pool() -> asyncpg.Pool:
-    global _pool
-    if _pool is None:
+    """One pool per event loop: a pool is bound to the loop that made it, and
+    scripts (dennis_report.py) call asyncio.run() once per day."""
+    global _pool, _pool_loop
+    loop = asyncio.get_running_loop()
+    if _pool is None or _pool_loop is not loop:
         _pool = await asyncpg.create_pool(_rw_dsn(), min_size=1, max_size=3)
+        _pool_loop = loop
     return _pool
 
 
@@ -672,6 +678,11 @@ async def pin_shared_item_today(item_id: str, pin: bool = True) -> str:
                 return "No such shared item for this workspace."
             if pin:
                 changed = await _pin_today(conn, iid)
+                if not changed:  # already pinned: re-stamp the day, as the PATCH does
+                    await conn.execute(
+                        f"UPDATE shared_list_items SET today_date={_TODAY_PT_SQL}, updated_at=now() "
+                        "WHERE workspace_id=$1 AND id=$2 AND today_date IS DISTINCT FROM "
+                        f"{_TODAY_PT_SQL}", USER_ID, iid)
             else:
                 changed = bool(row["today_pinned"])
                 await conn.execute(
@@ -743,8 +754,10 @@ def _clean(value, what: str) -> str:
     return v
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+async def _db_now(conn) -> datetime:
+    """The DB's clock (as the old SQL now() writes were), so actual_* and run
+    times never mix a drifting machine clock with DB timestamps."""
+    return await conn.fetchval("SELECT clock_timestamp()")
 
 
 def _utc(dt: datetime) -> datetime:
@@ -1175,15 +1188,18 @@ async def planner_set_day(day: str, blocks) -> str:
                         tid = _uuid_or_none(t.get("id"))
                         tfound = None
                         if tid:
-                            tfound = await conn.fetchval(
-                                "SELECT id FROM shared_list_items WHERE workspace_id=$1 AND "
-                                "is_private AND id=$2 AND parent_item_id IS NOT NULL",
-                                PLANNER_WS, tid)
+                            hit = await conn.fetchrow(
+                                "SELECT id, parent_item_id FROM shared_list_items WHERE "
+                                "workspace_id=$1 AND is_private AND id=$2", PLANNER_WS, tid)
+                            if hit is not None and hit["parent_item_id"] is None:
+                                raise ValueError("a block id was given as a task id")
+                            tfound = hit["id"] if hit is not None else None
                         if tfound:
                             await conn.execute(
                                 "UPDATE shared_list_items SET parent_item_id=$3, text=$4, "
-                                "note=COALESCE($5, note), tags=COALESCE($6::jsonb, tags), rank=$7, "
-                                "today_date=$8, planner_lane=CASE WHEN $9::int = 2 "
+                                "note=COALESCE($5, note), tags=CASE WHEN $6::jsonb IS NOT NULL THEN $6::jsonb "
+                                "WHEN tags IS NULL OR tags = '[]'::jsonb THEN '[\"other\"]'::jsonb "
+                                "ELSE tags END, rank=$7, today_date=$8, planner_lane=CASE WHEN $9::int = 2 "
                                 "THEN COALESCE($10::varchar, planner_lane, 'A') ELSE NULL END, "
                                 "updated_by='james', updated_at=now() "
                                 "WHERE workspace_id=$1 AND id=$2",
@@ -1253,11 +1269,16 @@ async def planner_add_task(block_id: str, text: str, lane: str | None = None,
                     "AND is_private = false", sid, USER_ID)
                 if not src:
                     return "Source item not found in the shared lists."
+            prefix, stripped = _split_lane_prefix(text or "")
+            use_prefix = bool(prefix) and want_lane is None
+            try:  # validate before any write, so a refusal saves nothing
+                clean = _clean(stripped if use_prefix else text, "text")
+            except ValueError as e:
+                return f"Not added: {e}"
             existing = (await _block_tasks(conn, [block["id"]]))[block["id"]]
             lanes = await _materialize_lanes(conn, block, existing)
-            prefix, stripped = _split_lane_prefix(text or "")
-            if prefix and want_lane is None:
-                want_lane, text = prefix, stripped
+            if use_prefix:
+                want_lane = prefix
                 if lanes != 2:
                     lanes = 2
                     await conn.execute(
@@ -1266,10 +1287,6 @@ async def planner_add_task(block_id: str, text: str, lane: str | None = None,
                     await conn.execute(
                         "UPDATE shared_list_items SET planner_lane='A' WHERE workspace_id=$1 "
                         "AND is_private AND parent_item_id=$2", PLANNER_WS, block["id"])
-            try:
-                clean = _clean(text, "text")
-            except ValueError as e:
-                return f"Not added: {e}"
             tid = uuid.uuid4()
             await conn.execute(
                 "INSERT INTO shared_list_items (id, list_id, parent_item_id, workspace_id, "
@@ -1339,7 +1356,7 @@ async def planner_start(task_id: str) -> str:
                 PLANNER_WS, t["id"])
             if active >= PLANNER_MAX_ACTIVE:
                 return f"At most {PLANNER_MAX_ACTIVE} timers can run at once. Stop one first."
-            now = _utcnow()
+            now = await _db_now(conn)
             await _open_run(conn, t, now)
             await conn.execute(
                 "UPDATE shared_list_items SET planner_status='active', done=false, done_at=NULL, "
@@ -1367,7 +1384,7 @@ async def planner_stop(task_id: str, accomplished: bool = False, note: str | Non
             t = await _load_task(conn, task_id)
             if t is None:
                 return "Planner task not found."
-            now = _utcnow()
+            now = await _db_now(conn)
             running = t["planner_status"] == "active"
             if running:
                 await _close_run(conn, t, now)
@@ -1380,10 +1397,12 @@ async def planner_stop(task_id: str, accomplished: bool = False, note: str | Non
             await conn.execute(
                 "UPDATE shared_list_items SET planner_status=$3::varchar, "
                 "done=($3::varchar = 'done'), "
-                "done_at=CASE WHEN $3::varchar = 'done' THEN $6::timestamptz ELSE NULL END, "
+                "done_at=CASE WHEN $3::varchar <> 'done' THEN NULL "
+                "WHEN $7::boolean OR done_at IS NULL THEN $6::timestamptz ELSE done_at END, "
                 "actual_end=CASE WHEN $4::boolean THEN $6::timestamptz ELSE actual_end END, "
                 "note=COALESCE($5::text, note), updated_by='james', updated_at=now() "
-                "WHERE workspace_id=$1 AND id=$2", PLANNER_WS, t["id"], status, running, note, now)
+                "WHERE workspace_id=$1 AND id=$2", PLANNER_WS, t["id"], status, running, note, now,
+                bool(accomplished))
             if accomplished:
                 synced = await _complete_source(conn, t, now)
             await _settle_block(conn, t["parent_item_id"], now)
@@ -1407,20 +1426,26 @@ async def planner_snooze(task_id: str, to_block_id: str | None = None) -> str:
                 target = await conn.fetchrow(
                     f"SELECT {_ITEM_COLS} FROM shared_list_items WHERE workspace_id=$1 "
                     "AND is_private AND parent_item_id IS NULL AND id<>$2 AND start_at >= $3 "
-                    "AND start_at < ($4::date + 1)::timestamp AT TIME ZONE $5 "
+                    "AND start_at < (COALESCE($4::date, ($3::timestamptz AT TIME ZONE $5)::date) + 1)"
+                    "::timestamp AT TIME ZONE $5 "
                     "ORDER BY start_at, created_at LIMIT 1 FOR UPDATE",
                     PLANNER_WS, cur["id"], cur["start_at"], cur["today_date"], PLANNER_TZ)
             if target is None:
                 return ("Target block not found." if to_block_id
                         else "No later block today to snooze into.")
-            now = _utcnow()
+            now = await _db_now(conn)
             running = t["planner_status"] == "active"
             if running:
                 await _close_run(conn, t, now)
-            others = [r for r in (await _block_tasks(conn, [target["id"]]))[target["id"]]
-                      if r["id"] != t["id"]]
-            lanes = await _materialize_lanes(conn, target, others)
-            lane = (t["planner_lane"] or "A") if lanes == 2 else None
+            # Same as backend move_task: lanes are materialized over the target's
+            # tasks as they stand (the task itself too, when snoozed in place).
+            all_target = (await _block_tasks(conn, [target["id"]]))[target["id"]]
+            lanes = await _materialize_lanes(conn, target, all_target)
+            others = [r for r in all_target if r["id"] != t["id"]]
+            own = await conn.fetchval(
+                "SELECT planner_lane FROM shared_list_items WHERE workspace_id=$1 AND id=$2",
+                PLANNER_WS, t["id"])
+            lane = (own or "A") if lanes == 2 else None
             await conn.execute(
                 "UPDATE shared_list_items SET parent_item_id=$3, today_date=$4, planner_lane=$5, "
                 "actual_end=CASE WHEN $6::boolean THEN $7::timestamptz ELSE actual_end END, "
