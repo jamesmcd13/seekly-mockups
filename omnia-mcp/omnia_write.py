@@ -680,7 +680,8 @@ async def pin_shared_item_today(item_id: str, pin: bool = True) -> str:
                 changed = await _pin_today(conn, iid)
                 if not changed:  # already pinned: re-stamp the day, as the PATCH does
                     await conn.execute(
-                        f"UPDATE shared_list_items SET today_date={_TODAY_PT_SQL}, updated_at=now() "
+                        f"UPDATE shared_list_items SET today_date={_TODAY_PT_SQL}, "
+                        "updated_by='james', updated_at=now() "
                         "WHERE workspace_id=$1 AND id=$2 AND today_date IS DISTINCT FROM "
                         f"{_TODAY_PT_SQL}", USER_ID, iid)
             else:
