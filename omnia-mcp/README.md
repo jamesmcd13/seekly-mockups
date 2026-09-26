@@ -1,17 +1,26 @@
 # Omnia MCP Server
 
-Exposes your **live Life-Omnia data** to Claude Code, **read-only**, so you can
-strategize over your real tasks/lists (and, via introspection, pipeline/contacts)
-on demand. Operator tool — separate from the website's source code.
+Exposes your **live Life-Omnia data** to Claude Code: read tools (read-only role +
+read-only transactions) plus a narrow set of scoped write tools. Operator tool —
+separate from the website's source code.
 
-Tasks live in **Omnia Lists** (`omnia_lists` / `omnia_tasks`). No Todoist.
+To-dos live in **Shared Lists** (`shared_lists` / `shared_list_items`); Quick ToDo
+is the default list. The old **Omnia Lists** (`omnia_lists` / `omnia_tasks`) were
+retired on 2026-09-25 (hidden in the app): nothing writes to them any more, and
+they are readable with `include_legacy=true`. No Todoist.
 
 ## Tools
 
 | Tool | What it does |
 |------|--------------|
-| `get_lists()` | Your Omnia lists (To-do / Long Term), excluding archived |
-| `get_tasks(status, list_name, due)` | Tasks, filtered — `status` open/done/all, `due` today/week/overdue |
+| `get_lists(include_legacy)` | Your Shared Lists (title, project, open count, id; `[default]` = Quick ToDo, `[private]`) |
+| `get_tasks(status, list_name, due, include_legacy)` | Shared-list to-dos with ids — `status` open/done/all, `due` today (incl. pinned)/week/overdue |
+| `add_task(title, list_name, due_date, description, priority, pin_today, pin_focus, list_id, source)` | Add a to-do; empty list -> Quick ToDo; an unknown list is refused (never silently shared); "Top to Do Today" -> Today; filing into Today / Focus pins it |
+| `add_todo(text, priority, pin_today, pin_focus, source)` | Add to Quick ToDo (P1 default) |
+| `add_list(name, kind, project, source)` | Create a Shared List (dedupes by title) |
+| `update_todo(kind, item_id, text, due_date, priority, note, list_id, list_title, pin_today, today_date, today_rank, pin_focus)` | Edit / move / pin one to-do (returns `Updated.`) |
+| `complete_task(task_id)` / `delete_todo(kind, item_id)` | Check off (with planner done-sync) / delete one to-do; retired Omnia-Lists ids: complete only |
+| `create_event(...)` | Not available (raises): no safe service path for calendar create yet |
 | `list_tables()` | All tables (to discover pipeline/contacts/messages/etc.) |
 | `describe_table(name)` | A table's columns + types |
 | `query(sql)` | A single read-only `SELECT`/`WITH` (capped 100 rows) for domains without typed tools yet |
@@ -68,5 +77,11 @@ works read-only.
 
 ## Notes
 - Everything is scoped to `OMNIA_USER_ID`. The read-only role + forced read-only
-  transactions are two independent write guards.
+  transactions are two independent write guards for the READ tools; the write
+  tools use the separate write DSN (`OMNIA_DB_DSN_RW`, else the backend .env).
+- Every write stamps provenance in `shared_list_items.origin_by`: the `source`
+  argument, else `$OMNIA_MCP_SOURCE`, else `brain:gv` inside omnia-gv-command,
+  else `mcp:<tool>`.
+- `tests/integration_shared_writers.py` exercises every writer against a Neon
+  BRANCH (`OMNIA_TEST_DB_HOST=<branch host>`); it refuses the prod endpoint.
 - `.env` is gitignored. Don't commit it.

@@ -1,8 +1,9 @@
 """
 Read-only adapter to the Life-Omnia Neon Postgres DB.
 
-Wired to the REAL Omnia Lists schema (omnia_lists / omnia_tasks), confirmed from
-the omnia-lists-todos domain export. Tasks live here now — no Todoist.
+To-dos live in SHARED LISTS (shared_lists / shared_list_items). The old Omnia
+Lists (omnia_lists / omnia_tasks) were retired on 2026-09-25 (hidden in the app,
+read-only); get_lists / get_tasks read them only with include_legacy=True.
 
 To run it you supply two things in .env (never in code/chat):
   OMNIA_DB_DSN    postgresql://<readonly-user>:<pw>@<host>/<db>?sslmode=require
@@ -48,62 +49,101 @@ async def _rows(sql: str, *args) -> list[asyncpg.Record]:
         return await conn.fetch(sql, *args)
 
 
-# --- Lists / Tasks (typed, real schema) --------------------------------------
+# --- Lists / Tasks: SHARED LISTS (the old Omnia Lists are retired) ------------
+# Planner PR #432 (2026-09-25) hid omnia_lists / omnia_tasks in the app and
+# every writer now targets Shared Lists, so these readers return Shared Lists:
+# the shared workspace (USER_ID, which Michael can also see) plus James's
+# private lists workspace once private mode exists. Never the planner
+# workspace. The retired lists are still readable with include_legacy=True.
 
-async def get_lists() -> str:
+LISTS_PRIVATE_WS = f"{USER_ID}:lists:private"
+_LIST_WORKSPACES = [USER_ID, LISTS_PRIVATE_WS]
+
+
+def _like(q: str) -> str:
+    """A literal ILIKE contains-pattern (% and _ escaped; pair with ESCAPE '\\')."""
+    esc = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{esc}%"
+
+
+def _ws_tag(ws: str) -> str:
+    return "private" if (ws or "").endswith(":private") else ""
+
+
+async def _legacy_lists() -> list[str]:
     rows = await _rows(
         """
-        SELECT name, kind, is_template, archived
+        SELECT name, kind, is_template
         FROM omnia_lists
         WHERE user_id = $1 AND NOT archived
         ORDER BY kind, name
         """,
         USER_ID,
     )
-    if not rows:
-        return "No Omnia lists found."
-    out = []
+    return [f"- {r['name']} ({r['kind']}){' [template]' if r['is_template'] else ''}"
+            for r in rows]
+
+
+async def get_lists(include_legacy: bool = False) -> str:
+    rows = await _rows(
+        r"""
+        SELECT l.id, l.title, l.workspace_id, l.is_quick_default, p.title AS project,
+               (SELECT count(*) FROM shared_list_items i
+                 WHERE i.list_id = l.id AND i.workspace_id = l.workspace_id
+                   AND i.parent_item_id IS NULL AND NOT i.done) AS open_items
+          FROM shared_lists l
+          LEFT JOIN shared_projects p
+            ON p.id = l.project_id AND p.workspace_id = ANY($1::text[])
+         WHERE l.workspace_id = ANY($1::text[]) AND NOT l.archived
+         ORDER BY l.is_quick_default DESC, (lower(l.title) = 'today') DESC,
+                  (l.workspace_id = $2) DESC, p.title NULLS FIRST, l.position, l.title
+        """,
+        _LIST_WORKSPACES, USER_ID,
+    )
+    out = ["Shared Lists (every to-do lives here; Quick ToDo is the default):"]
     for r in rows:
-        tag = " [template]" if r["is_template"] else ""
-        out.append(f"- {r['name']} ({r['kind']}){tag}")
+        tags = [t for t in ("default" if r["is_quick_default"] else "",
+                            _ws_tag(r["workspace_id"])) if t]
+        proj = f" · {r['project']}" if r["project"] else ""
+        tag_s = f" [{', '.join(tags)}]" if tags else ""
+        out.append(f"- {r['title']}{proj} · {r['open_items']} open{tag_s} [id {r['id']}]")
+    if len(out) == 1:
+        out.append("(no shared lists)")
+    if include_legacy:
+        legacy = await _legacy_lists()
+        out.append("")
+        out.append("Retired Omnia Lists (hidden in the app, read-only):")
+        out.extend(legacy or ["(none)"])
     return "\n".join(out)
 
 
-async def get_tasks(status: str = "open", list_name: str | None = None,
-                    due: str | None = None) -> str:
+async def _legacy_tasks(status: str, list_name: str | None, due: str | None) -> list[str]:
     where = ["t.user_id = $1"]
     args: list = [USER_ID]
-
-    # status: "open" (default) | "done" | "all"
     if status == "open":
         where.append("t.status <> 'done'")
     elif status == "done":
         where.append("t.status = 'done'")
-    # "all" -> no status filter
-
     if due == "today":
         where.append("t.due_date <= CURRENT_DATE")
     elif due == "week":
         where.append("t.due_date <= CURRENT_DATE + INTERVAL '7 days'")
     elif due == "overdue":
         where.append("t.due_date < CURRENT_DATE AND t.status <> 'done'")
-
     if list_name:
-        args.append(f"%{list_name}%")
-        where.append(f"l.name ILIKE ${len(args)}")
-
-    sql = f"""
-        SELECT t.name AS title, t.due_date, t.priority, t.status, t.rrule, l.name AS list
+        args.append(_like(list_name))
+        where.append(f"l.name ILIKE ${len(args)} ESCAPE '\\'")
+    rows = await _rows(
+        f"""
+        SELECT t.id, t.name AS title, t.due_date, t.priority, t.status, t.rrule, l.name AS list
         FROM omnia_tasks t
-        LEFT JOIN omnia_lists l
-          ON l.id = t.list_id AND l.user_id = t.user_id
+        LEFT JOIN omnia_lists l ON l.id = t.list_id AND l.user_id = t.user_id
         WHERE {' AND '.join(where)}
         ORDER BY t.due_date NULLS LAST
         LIMIT 200
-    """
-    rows = await _rows(sql, *args)
-    if not rows:
-        return "No tasks match that filter."
+        """,
+        *args,
+    )
     out = []
     for r in rows:
         lst = f" [{r['list']}]" if r["list"] else ""
@@ -111,7 +151,62 @@ async def get_tasks(status: str = "open", list_name: str | None = None,
         pri = f" !P{r['priority']}" if r["priority"] not in (None, 0) else ""
         rec = " ↻" if r["rrule"] else ""
         done = " ✓" if r["status"] == "done" else ""
-        out.append(f"- {r['title']}{lst}{due_s}{pri}{rec}{done}")
+        out.append(f"- {r['title']}{lst}{due_s}{pri}{rec}{done} [id {r['id']}]")
+    return out
+
+
+async def get_tasks(status: str = "open", list_name: str | None = None,
+                    due: str | None = None, include_legacy: bool = False) -> str:
+    """Shared Lists to-dos (top-level items). status open|done|all; list_name =
+    partial list title; due today (due today or earlier, or pinned to Today) |
+    week | overdue. Each line ends with the item id."""
+    where = ["i.workspace_id = ANY($1::text[])", "NOT l.archived", "i.parent_item_id IS NULL"]
+    args: list = [_LIST_WORKSPACES]
+    if status == "open":
+        where.append("NOT i.done")
+    elif status == "done":
+        where.append("i.done")
+    # due_date is a calendar day stored as a timestamptz at UTC midnight; the
+    # app reads its UTC date part. "Today" is the Pacific day.
+    day_sql = "(i.due_date AT TIME ZONE 'UTC')::date"
+    today_sql = "(now() AT TIME ZONE 'America/Los_Angeles')::date"
+    if due == "today":
+        where.append(f"({day_sql} <= {today_sql} OR i.today_pinned)")
+    elif due == "week":
+        where.append(f"{day_sql} <= {today_sql} + 7")
+    elif due == "overdue":
+        where.append(f"{day_sql} < {today_sql} AND NOT i.done")
+    if list_name:
+        args.append(_like(list_name))
+        where.append(f"l.title ILIKE ${len(args)} ESCAPE '\\'")
+    rows = await _rows(
+        f"""
+        SELECT i.id, i.text, {day_sql} AS due, i.priority, i.done, i.today_pinned,
+               i.is_focus, l.title AS list, l.workspace_id
+          FROM shared_list_items i
+          JOIN shared_lists l ON l.id = i.list_id AND l.workspace_id = i.workspace_id
+         WHERE {' AND '.join(where)}
+         ORDER BY i.done, i.due_date NULLS LAST, i.priority NULLS LAST, i.rank NULLS LAST,
+                  i.created_at
+         LIMIT 200
+        """,
+        *args,
+    )
+    out = []
+    for r in rows:
+        where_s = r["list"] + (", private" if _ws_tag(r["workspace_id"]) else "")
+        due_s = f" (due {r['due']})" if r["due"] else ""
+        pri = f" !P{r['priority']}" if r["priority"] else ""
+        pins = (" · Today" if r["today_pinned"] else "") + (" · Focus" if r["is_focus"] else "")
+        done = " ✓" if r["done"] else ""
+        out.append(f"- {r['text']} [{where_s}]{due_s}{pri}{pins}{done} [id {r['id']}]")
+    if not out:
+        out = ["No to-dos match that filter."]
+    if include_legacy:
+        legacy = await _legacy_tasks(status, list_name, due)
+        out.append("")
+        out.append("Retired Omnia Lists (hidden in the app, read-only; complete_task still works):")
+        out.extend(legacy or ["(none)"])
     return "\n".join(out)
 
 
