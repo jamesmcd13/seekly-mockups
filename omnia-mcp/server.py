@@ -285,18 +285,23 @@ async def add_contact(name: str, email: str = "", phone: str = "",
 
 
 @mcp.tool()
-async def add_list(name: str, kind: str = "todo", project: str = "", source: str = "") -> str:
+async def add_list(name: str, kind: str = "todo", project: str = "", private: bool = False,
+                   source: str = "") -> str:
     """Create a new SHARED LIST (skips duplicates: an existing list with that
-    title is returned instead). It's visible to Michael, like every shared list.
+    title is returned instead). Visible to Michael, like every shared list,
+    unless private=true.
 
     Args:
         name: list name.
         kind: 'todo' (default) or 'longterm' (a standing list); also accepts the
             Shared Lists kinds main / project / standing.
         project: optional existing Shared Lists project to file it under.
+        private: true = James-only private list (never shown to Michael). A list
+            filed in a private project is always private.
         source: optional provenance tag, e.g. 'brain:gv'.
     """
-    return await omniaw.add_list(name, kind, project or "", source=source or None)
+    return await omniaw.add_list(name, kind, project or "", private=private,
+                                 source=source or None)
 
 
 

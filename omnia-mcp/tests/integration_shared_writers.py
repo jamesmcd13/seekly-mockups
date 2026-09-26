@@ -414,6 +414,26 @@ async def main() -> None:
     check(", private" in gt, "get_tasks marks private", gt)
     planner_ws_hits = await w.find_todos(f"{TAG} planned")
     check(planner_ws_hits == [], "find_todos never returns planner rows", planner_ws_hits)
+    # add_list(private=True) and a list filed in a PRIVATE project is always private
+    r = await w.add_list(f"{TAG} private list", private=True)
+    plid = id_of(r)
+    CREATED_LISTS.append(plid)
+    pproj = uuid.uuid4()
+    async with pool.acquire() as conn:
+        ws = await conn.fetchval("SELECT workspace_id FROM shared_lists WHERE id=$1", plid)
+        await conn.execute("INSERT INTO shared_projects (id, workspace_id, title, created_by) "
+                           "VALUES ($1, 'james:lists:private', $2, 'james')", pproj, f"{TAG} PProj")
+    check(ws == "james:lists:private" and r.startswith("Created private list"),
+          "add_list private=True", (r, ws))
+    r = await w.add_list(f"{TAG} in private project", "todo", f"{TAG} PProj")
+    plid2 = id_of(r)
+    CREATED_LISTS.append(plid2)
+    async with pool.acquire() as conn:
+        row = await one(conn, "SELECT workspace_id, project_id FROM shared_lists WHERE id=$1", plid2)
+    check(row["workspace_id"] == "james:lists:private" and row["project_id"] == pproj
+          and "its project is private" in r, "add_list into a private project is private", r)
+    r = await w.add_list(f"{TAG} private list", private=True)
+    check("already exists" in r and str(plid) in r, "add_list private dedupe", r)
 
     # 22. ambient provenance: env var, then the GV cwd heuristic
     os.environ["OMNIA_MCP_SOURCE"] = "brain:loop"
@@ -488,6 +508,7 @@ async def main() -> None:
         await conn.execute("DELETE FROM shared_list_items WHERE id = ANY($1::uuid[])", CREATED_ITEMS)
         await conn.execute("DELETE FROM shared_list_items WHERE text LIKE $1", f"{TAG}%")
         await conn.execute("DELETE FROM shared_lists WHERE id = ANY($1::uuid[])", CREATED_LISTS)
+        await conn.execute("DELETE FROM shared_projects WHERE title LIKE $1", f"{TAG}%")
 
     print(f"\n{PASSES} checks passed, {len(FAILS)} failed")
     if FAILS:

@@ -831,13 +831,16 @@ async def add_contact(name: str, email: str | None = None, phone: str | None = N
 
 
 async def add_list(name: str, kind: str = "todo", project: str = "", *,
-                   source: str | None = None) -> str:
-    """Create a SHARED LIST in the shared workspace (the old Omnia Lists are
-    retired). Skips duplicates: a non-archived list with the same title (any
-    case) is returned instead. kind: 'todo' (default, a normal list) |
-    'longterm' (a standing list) | or the Shared Lists kinds main / project /
-    standing. project: optional existing Shared Lists project to file it under
-    (exact title, else a unique partial match); omitted = unfiled. Position is
+                   private: bool = False, source: str | None = None) -> str:
+    """Create a SHARED LIST (the old Omnia Lists are retired). Skips duplicates:
+    a non-archived list with the same title (any case) in the same workspace is
+    returned instead. kind: 'todo' (default, a normal list) | 'longterm' (a
+    standing list) | or the Shared Lists kinds main / project / standing.
+    project: optional existing project to file it under (exact title, else a
+    unique partial match; shared or James's private projects); omitted =
+    unfiled. private: create it in James's private lists workspace
+    ('<uid>:lists:private', invisible to Michael; private mode contract
+    2026-09-25). A list filed in a PRIVATE project is always private. Position is
     the end of that bucket, as POST /v1/shared-lists does."""
     title = (name or "").strip()
     if not title:
@@ -852,17 +855,14 @@ async def add_list(name: str, kind: str = "todo", project: str = "", *,
             # Two racing add_list calls must not both miss the duplicate check.
             await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))",
                                f"{USER_ID}:mcp-add-list")
-            dup = await conn.fetchrow(
-                "SELECT id, title FROM shared_lists WHERE workspace_id=$1 AND archived=false "
-                "AND lower(title)=lower($2) ORDER BY created_at LIMIT 1", USER_ID, title)
-            if dup:
-                return f"List '{dup['title']}' already exists. [id {dup['id']}]"
             project_id = project_title = None
+            forced_private = False
             if (project or "").strip():
                 prows = await conn.fetch(
-                    "SELECT id, title FROM shared_projects WHERE workspace_id=$1 "
-                    r"AND archived=false AND title ILIKE $2 ESCAPE '\' ORDER BY created_at",
-                    USER_ID, _like_arg(project.strip()))
+                    "SELECT id, title, workspace_id FROM shared_projects "
+                    "WHERE workspace_id = ANY($1::text[]) AND archived=false "
+                    r"AND title ILIKE $2 ESCAPE '\' ORDER BY (workspace_id = $3) DESC, created_at",
+                    _LIST_WORKSPACES, _like_arg(project.strip()), USER_ID)
                 pick = ([r for r in prows if r["title"].strip().lower() == project.strip().lower()]
                         or prows)
                 if not pick:
@@ -871,16 +871,26 @@ async def add_list(name: str, kind: str = "todo", project: str = "", *,
                     names = ", ".join(f"{r['title']} (id {r['id']})" for r in pick[:8])
                     return f"'{project.strip()}' matches several projects: {names}."
                 project_id, project_title = pick[0]["id"], pick[0]["title"]
+                forced_private = _is_private_ws(pick[0]["workspace_id"]) and not private
+                private = private or _is_private_ws(pick[0]["workspace_id"])
+            ws = LISTS_PRIVATE_WS if private else USER_ID
+            dup = await conn.fetchrow(
+                "SELECT id, title FROM shared_lists WHERE workspace_id=$1 AND archived=false "
+                "AND lower(title)=lower($2) ORDER BY created_at LIMIT 1", ws, title)
+            if dup:
+                return f"List '{dup['title']}' already exists. [id {dup['id']}]"
             pos = await conn.fetchval(
                 "SELECT COALESCE(MAX(position), -1) + 1 FROM shared_lists WHERE workspace_id=$1 "
-                "AND project_id IS NOT DISTINCT FROM $2::uuid", USER_ID, project_id)
+                "AND project_id IS NOT DISTINCT FROM $2::uuid", ws, project_id)
             lid = uuid.uuid4()
             await conn.execute(
                 "INSERT INTO shared_lists (id, workspace_id, project_id, title, kind, position, "
                 "created_by, created_at, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,now(),now())",
-                lid, USER_ID, project_id, title, k, pos, created_by)
+                lid, ws, project_id, title, k, pos, created_by)
     where = f" in project '{project_title}'" if project_title else ""
-    return f"Created shared list '{title}' ({k}){where}. [id {lid}]"
+    what = "private list" if private else "shared list"
+    why = " (its project is private)" if forced_private else ""
+    return f"Created {what} '{title}' ({k}){where}{why}. [id {lid}]"
 
 
 # --- Today / Focus pins --------------------------------------------------------
