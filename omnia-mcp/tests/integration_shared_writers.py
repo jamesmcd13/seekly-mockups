@@ -145,13 +145,25 @@ async def main() -> None:
     check(str(row["due_date"].date()) == "2026-10-01" and row["due_date"].utcoffset().total_seconds() == 0,
           "add_task due as UTC midnight", row["due_date"])
 
-    # 3. unknown list -> Quick ToDo with a note in the reply
+    # 3. unknown list -> REFUSED, nothing written (never silently shared)
+    async with pool.acquire() as conn:
+        n0 = await conn.fetchval("SELECT count(*) FROM shared_list_items")
     r = await w.add_task(f"{TAG} unknown list", "No Such List Anywhere 42")
+    async with pool.acquire() as conn:
+        n1 = await conn.fetchval("SELECT count(*) FROM shared_list_items")
+    check("No Shared List matches" in r and "Nothing was added" in r and n0 == n1,
+          "add_task unknown list refused", r)
+    # 3b. a real third row so later index-based steps keep their meaning
+    r = await w.add_task(f"{TAG} third row", "")
+    CREATED_ITEMS.append(id_of(r))
+    # 3c. filing into the Today list pins it (the TODAY band needs the pin)
+    r = await w.add_task(f"{TAG} into Today list", "today")
     iid = id_of(r)
     CREATED_ITEMS.append(iid)
     async with pool.acquire() as conn:
-        row = await one(conn, "SELECT list_id FROM shared_list_items WHERE id=$1", iid)
-    check(row["list_id"] == quick["id"] and "went to Quick ToDo" in r, "add_task unknown -> Quick ToDo", r)
+        row = await one(conn, "SELECT list_id, today_pinned FROM shared_list_items WHERE id=$1", iid)
+    check(row["list_id"] == today["id"] and row["today_pinned"] and "pinned to Today" in r,
+          "add_task into Today list auto-pins", r)
 
     # 4. legacy "Top to Do Today" -> Today list, pinned
     r = await w.add_task(f"{TAG} today alias", "Top to Do Today")
@@ -219,9 +231,11 @@ async def main() -> None:
           and str(row["today_date"]) == "2026-09-30" and row["priority"] == 3 and row["note"] == "n"
           and row["origin_by"] == "mcp:add_shared_item", "add_shared_item id+pins", dict(row))
     r = await w.add_shared_item("No Such List Anywhere 42", f"{TAG} strict")
-    check("No shared list matches" in r, "add_shared_item strict (no fallback)", r)
+    check("No Shared List matches" in r, "add_shared_item strict (no fallback)", r)
     r = await w.add_shared_item("", "x")
     check(r == "Give list_id or list_title.", "add_shared_item needs a list", r)
+    r = await w.add_shared_item("Platform", f"{TAG} rank no pin", today_rank=5)
+    check("need pin_today" in r and "[id" not in r, "add_shared_item today_rank needs pin", r)
 
     # 11. add_list
     lname = f"{TAG} New List"
@@ -274,7 +288,22 @@ async def main() -> None:
         row = await one(conn, "SELECT list_id FROM shared_list_items WHERE id=$1", target)
     check(row["list_id"] == platform["id"], "update_todo moved to Platform")
     r = await w.update_todo("task", str(target), list_title="No Such List Anywhere 42")
-    check("No shared list matches" in r, "update_todo unknown list", r)
+    check("No Shared List matches" in r, "update_todo unknown list", r)
+    # same-value edits are a successful no-op (callers compare "Updated.")
+    async with pool.acquire() as conn:
+        cur_pr = await conn.fetchval("SELECT priority FROM shared_list_items WHERE id=$1", target)
+    r = await w.update_todo("task", str(target), priority=cur_pr or 0)
+    check(r == "Updated.", "update_todo same-value priority is Updated.", r)
+    r = await w.update_todo("task", str(target), list_title="Platform")
+    check(r == "Updated.", "update_todo same-list move is Updated.", r)
+    # a bare today_date on an unpinned item is refused
+    async with pool.acquire() as conn:
+        pinned = await conn.fetchval("SELECT today_pinned FROM shared_list_items WHERE id=$1", target)
+    if not pinned:
+        r = await w.update_todo("task", str(target), today_date="2026-10-10")
+        check("needs pin_today" in r, "update_todo today_date needs a pin", r)
+    check("priority must be" in await w.update_todo("task", str(target), priority=0.5),
+          "priority 0.5 does not clear")
     # subtasks move with their parent; a subtask alone cannot be moved
     sub = uuid.uuid4()
     async with pool.acquire() as conn:
@@ -511,6 +540,22 @@ async def main() -> None:
         check(False, "tool create_event must error", res)
     except Exception as e:  # FastMCP raises ToolError on a tool exception
         check("calendar create not available" in str(e), "tool create_event errors", str(e))
+
+    # 24. the READ tools under the real read-only role (omnia_readonly), if configured
+    live_env = Path(r"C:\Users\James\dev\seekly-mockups\omnia-mcp\.env")
+    ro_raw = next((ln.split("=", 1)[1].strip().strip('"').strip("'")
+                   for ln in live_env.read_text(encoding="utf-8", errors="ignore").splitlines()
+                   if ln.startswith("OMNIA_DB_DSN=")), None) if live_env.exists() else None
+    if ro_raw:
+        ro_dsn = re.sub(r"@[^/:?]+", "@" + os.environ["OMNIA_TEST_DB_HOST"], ro_raw, count=1)
+        assert PROD_ENDPOINT not in ro_dsn
+        rc.DSN, rc._pool = ro_dsn, None
+        gl = await rc.get_lists()
+        gt = await rc.get_tasks(list_name="Quick", include_legacy=True)
+        check("Quick ToDo" in gl and TAG in gt and "Retired Omnia Lists" in gt,
+              "read tools work as omnia_readonly", (gl[:120], gt[:120]))
+    else:
+        print("(no read-only DSN configured; skipped the omnia_readonly smoke)")
 
     # nothing ever landed in the retired tables
     async with pool.acquire() as conn:

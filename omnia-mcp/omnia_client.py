@@ -93,7 +93,7 @@ async def get_lists(include_legacy: bool = False) -> str:
                    AND i.parent_item_id IS NULL AND NOT i.done) AS open_items
           FROM shared_lists l
           LEFT JOIN shared_projects p
-            ON p.id = l.project_id AND p.workspace_id = l.workspace_id
+            ON p.id = l.project_id AND p.workspace_id = ANY($1::text[])
          WHERE l.workspace_id = ANY($1::text[]) AND NOT l.archived
          ORDER BY l.is_quick_default DESC, (lower(l.title) = 'today') DESC,
                   (l.workspace_id = $2) DESC, p.title NULLS FIRST, l.position, l.title

@@ -120,10 +120,12 @@ async def add_task(title: str, list_name: str = "", due_date: str = "",
                    description: str = "", priority: int | None = None,
                    pin_today: bool = False, pin_focus: bool = False,
                    list_id: str = "", source: str = "") -> str:
-    """Add a to-do to a SHARED LIST (Omnia's one to-do store). With no list, or a
-    list name that doesn't exist, it lands in Quick ToDo (the reply says so).
-    Old list names meaning today ("Top to Do Today") go to the Today list,
-    pinned. Verify afterward with get_tasks.
+    """Add a to-do to a SHARED LIST (Omnia's one to-do store). No list = Quick
+    ToDo (the default inbox; shared with Michael, like every shared list). A
+    list name that doesn't exist is REFUSED and nothing is added (pick an
+    existing list from get_lists, leave it empty for Quick ToDo, or add_list
+    first). Old names meaning today ("Top to Do Today") go to the Today list;
+    filing into the Today / Focus list pins it there. Verify with get_tasks.
 
     Args:
         title: the to-do text.
@@ -193,9 +195,11 @@ async def update_todo(kind: str, item_id: str, text: str = "", due_date: str = "
         due_date: new due date 'YYYY-MM-DD', or 'clear' (optional).
         priority: new priority 1..5 (1 = P1), or 0 to clear it (optional).
         note: new note (optional).
-        list_id / list_title: move it to another list (same shared/private side).
+        list_id / list_title: move it to another list (same shared/private side;
+            its subtasks move with it; moving into Today / Focus pins it).
         pin_today: true = pin to Today, false = unpin (optional).
-        today_date: 'YYYY-MM-DD' Today stamp (optional; default today when pinning).
+        today_date: 'YYYY-MM-DD' Today stamp (optional; needs pin_today=true or
+            an item already pinned; default today when pinning).
         today_rank: order within Today, lower = earlier (optional).
         pin_focus: true = add to Focus, false = remove (optional).
     """
@@ -339,9 +343,10 @@ async def add_shared_item(list_title: str = "", text: str = "", priority: int | 
         pin_today: true = also pin the new item to Today (the /shared-lists
             TODAY band: today_pinned, today_date = today in Pacific, appended
             at the end of Today's order).
-        pin_focus: true = also add it to Focus (today's must-dos).
-        today_date: optional 'YYYY-MM-DD' Today stamp (with pin_today).
-        today_rank: optional order within Today, lower = earlier (with
+        pin_focus: true = also add it to Focus (today's must-dos). Filing into
+            the Today / Focus list pins it there automatically.
+        today_date: optional 'YYYY-MM-DD' Today stamp (needs pin_today).
+        today_rank: optional order within Today, lower = earlier (needs
             pin_today; e.g. 1000, 2000, 3000 for a Top 3).
         note: optional longer note.
         source: optional provenance tag, e.g. 'claude:plan-day'.

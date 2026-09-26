@@ -15,7 +15,7 @@ they are readable with `include_legacy=true`. No Todoist.
 |------|--------------|
 | `get_lists(include_legacy)` | Your Shared Lists (title, project, open count, id; `[default]` = Quick ToDo, `[private]`) |
 | `get_tasks(status, list_name, due, include_legacy)` | Shared-list to-dos with ids — `status` open/done/all, `due` today (incl. pinned)/week/overdue |
-| `add_task(title, list_name, due_date, description, priority, pin_today, pin_focus, list_id, source)` | Add a to-do; unknown/empty list -> Quick ToDo; "Top to Do Today" -> Today, pinned |
+| `add_task(title, list_name, due_date, description, priority, pin_today, pin_focus, list_id, source)` | Add a to-do; empty list -> Quick ToDo; an unknown list is refused (never silently shared); "Top to Do Today" -> Today; filing into Today / Focus pins it |
 | `add_todo(text, priority, pin_today, pin_focus, source)` | Add to Quick ToDo (P1 default) |
 | `add_list(name, kind, project, source)` | Create a Shared List (dedupes by title) |
 | `update_todo(kind, item_id, text, due_date, priority, note, list_id, list_title, pin_today, today_date, today_rank, pin_focus)` | Edit / move / pin one to-do (returns `Updated.`) |

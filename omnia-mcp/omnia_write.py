@@ -15,10 +15,13 @@ omnia_tasks or omnia_lists any more; the only legacy write left is
 complete_task checking off an OLD row by id. See the SHARED LISTS section.
 
 SAFETY (matches James's production-DB rules):
-  - INSERT + tightly-scoped single-row UPDATE + tightly-scoped single-row DELETE.
-    Every DELETE/UPDATE is keyed by a specific id AND scoped by user_id/workspace_id,
-    so the blast radius is exactly one row the caller owns. NO bulk delete, NO
-    unscoped DELETE/UPDATE, NO DDL, NO TRUNCATE — not anywhere in this file.
+  - INSERT + tightly-scoped UPDATE/DELETE. Every DELETE/UPDATE is keyed by a
+    specific id AND scoped by user_id/workspace_id, so the blast radius is one row
+    the caller owns, plus two BOUNDED families keyed by that id: update_todo's
+    list move also moves the item's own subtasks (parent_item_id = id), and
+    complete_task finishes the planner tasks planned from the item
+    (source_item_id = id, exact planner workspace). NO bulk delete, NO unscoped
+    DELETE/UPDATE, NO DDL, NO TRUNCATE — not anywhere in this file.
   - Contact "delete" is a SOFT delete (sets deleted_at), never a hard wipe.
   - Every statement is scoped by user_id / workspace_id.
   - Writes are reversible via Neon point-in-time restore.
@@ -119,7 +122,24 @@ async def _get_pool() -> asyncpg.Pool:
 # not existing yet. A new item's workspace + is_private always follow its LIST:
 # the DB CHECK ck_shared_list_items_private_workspace pins is_private to a
 # ':private' workspace, both directions. The PLANNER workspace ('<uid>:private')
-# is never a list target here: planner rows go through the planner_* tools only.
+# is never a list target here: planner rows go through the planner_* tools only,
+# with ONE deliberate exception: complete_task finishes the planner tasks planned
+# from the item it checks off (the list -> planner done-sync the app's checkbox
+# does via services/planner_links.complete_linked_tasks), exact-match on the
+# planner workspace and bounded by source_item_id.
+#
+# ORDER. The rank / today_rank / focus_rank "end of band / bucket" reads span
+# BOTH list workspaces (the private-mode backend orders James's merged view the
+# same way), while every write stays in the row's own workspace.
+#
+# TODAY / FOCUS LISTS. An item filed in the list titled "Today" is pinned to Today
+# and one filed in "Focus" joins the Focus bucket, so it shows in the /shared-lists
+# TODAY / FOCUS bands and not only inside that list.
+#
+# UNKNOWN LIST NAMES are refused (as the old add_task did), never silently filed
+# somewhere else: the old Omnia Lists were James-only, and a name that doesn't
+# exist in Shared Lists must not quietly land in a list Michael can read. An
+# empty list name means Quick ToDo, the default inbox (shared with Michael).
 #
 # PROVENANCE (no migration). created_by = who the row is FOR ('james'), or
 # 'claude' for Claude's own rows (add_todo keeps its old 'claude' stamp);
@@ -135,6 +155,10 @@ async def _get_pool() -> asyncpg.Pool:
 # earlier MCP tools), which also keeps a private item's text out of the shared
 # activity feed Michael can read.
 
+if not re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", USER_ID):
+    # _LIST_FROM below embeds the workspace ids as SQL literals; a tenant key is
+    # a plain slug ('james'), so anything else is a config error, never SQL.
+    raise RuntimeError("OMNIA_USER_ID must be a plain slug (letters, digits, _ . -).")
 LISTS_PRIVATE_WS = f"{USER_ID}:lists:private"
 _LIST_WORKSPACES = [USER_ID, LISTS_PRIVATE_WS]
 QUICK_DEFAULT_PRIORITY = 1
@@ -148,16 +172,22 @@ _TODAY_ALIASES = {"top to do today", "top to-do today", "top todo today", "plan 
 # Omnia-List kinds, mapped so existing add_list callers keep working.
 _LIST_KINDS = {"todo": "project", "longterm": "standing", "long_term": "standing",
                "main": "main", "project": "project", "standing": "standing"}
-_LIST_COLS = "l.id, l.title, l.workspace_id, l.is_quick_default, p.title AS project"
+_LIST_COLS = ("l.id, l.title, l.workspace_id, l.is_quick_default, l.archived, "
+              "p.title AS project")
+# A private list may sit in a SHARED project (private mode, invariant 2), so the
+# project join spans both list workspaces rather than requiring the same one.
 _LIST_FROM = ("FROM shared_lists l LEFT JOIN shared_projects p "
-              "ON p.id = l.project_id AND p.workspace_id = l.workspace_id")
+              "ON p.id = l.project_id AND p.workspace_id IN "
+              f"('{USER_ID}', '{LISTS_PRIVATE_WS}')")
 
 
 def _ambient_source() -> str:
     """The write path when the caller passed no `source`: $OMNIA_MCP_SOURCE if
     the launcher set it, else 'brain:gv' when this process runs inside the GV
     text-brain (the watcher launches headless Claude, and its executors import
-    this module, from C:/Users/James/dev/omnia-gv-command*). '' = unknown."""
+    this module, from C:/Users/James/dev/omnia-gv-command*). An interactive
+    Claude session opened inside that folder is tagged brain:gv too, which is
+    fine: it is working on the text brain. '' = unknown."""
     env = (os.environ.get("OMNIA_MCP_SOURCE") or "").strip()
     if env:
         return env
@@ -235,6 +265,16 @@ def _list_label(row) -> str:
     return row["title"] + (" (private)" if _is_private_ws(row["workspace_id"]) else "")
 
 
+def _pins_for(lst) -> tuple[bool, bool]:
+    """(pin_today, pin_focus) implied by the list itself: the SHARED list titled
+    'Today' / 'Focus' is that band's own list, so an item filed there must also
+    carry the pin or the /shared-lists TODAY / FOCUS band never shows it."""
+    if lst["workspace_id"] != USER_ID:
+        return False, False
+    t = (lst["title"] or "").strip().lower()
+    return t == "today", t == "focus"
+
+
 async def _list_by_id(conn, list_id: str):
     lid = _uuid_or_none(list_id)
     if lid is None:
@@ -249,11 +289,17 @@ async def _list_by_id(conn, list_id: str):
 
 
 async def _quick_list(conn):
-    """Quick ToDo: the list flagged is_quick_default (rename-proof), else the
-    oldest list titled 'Quick ToDo' (the backend's adopt-by-title step)."""
+    """Quick ToDo, resolved like the backend's _ensure_quick_list: the list
+    flagged is_quick_default (rename-proof; an ARCHIVED flagged list is
+    un-archived, as the backend does, because it still owns the one-per-workspace
+    slot), else the oldest list titled 'Quick ToDo' (adopt-by-title)."""
     row = await conn.fetchrow(
         f"SELECT {_LIST_COLS} {_LIST_FROM} WHERE l.workspace_id = $1 "
-        "AND l.is_quick_default AND l.archived = false ORDER BY l.created_at LIMIT 1", USER_ID)
+        "AND l.is_quick_default ORDER BY l.created_at LIMIT 1", USER_ID)
+    if row is not None and row["archived"]:
+        await conn.execute(
+            "UPDATE shared_lists SET archived = false, updated_at = now() "
+            "WHERE workspace_id = $1 AND id = $2", USER_ID, row["id"])
     if row is None:
         row = await conn.fetchrow(
             f"SELECT {_LIST_COLS} {_LIST_FROM} WHERE l.workspace_id = $1 "
@@ -283,39 +329,43 @@ def _ambiguous(title: str, rows) -> ValueError:
 
 
 async def _resolve_list(conn, list_title: str | None = None, list_id: str | None = None,
-                        *, fallback_quick: bool):
-    """-> (list_row, note). By id (exact) or by title: one exact match wins,
-    else one partial match; several -> ValueError (never guess); none -> Quick
-    ToDo when `fallback_quick` (note says so), else ValueError. No title and no
-    id -> Quick ToDo (or ValueError without fallback)."""
+                        *, empty_is_quick: bool):
+    """The target list: by id (exact), or by title (one exact match wins, else
+    one partial match). Several matches -> ValueError (never guess). No match ->
+    ValueError: an unknown name is never silently filed elsewhere (see UNKNOWN
+    LIST NAMES above). No title and no id -> Quick ToDo when `empty_is_quick`."""
     if (list_id or "").strip():
-        return await _list_by_id(conn, list_id.strip()), None
+        return await _list_by_id(conn, list_id.strip())
     title = (list_title or "").strip()
     if not title:
-        if fallback_quick:
-            return await _quick_list(conn), None
+        if empty_is_quick:
+            return await _quick_list(conn)
         raise ValueError("Give list_id or list_title.")
     exact, rows = await _lists_matching(conn, title)
     if len(exact) == 1:
-        return exact[0], None
+        return exact[0]
     if len(exact) > 1:
         raise _ambiguous(title, exact)
     if len(rows) == 1:
-        return rows[0], None
+        return rows[0]
     if len(rows) > 1:
         raise _ambiguous(title, rows)
-    if not fallback_quick:
-        raise ValueError(f"No shared list matches '{title}' (see get_shared_lists).")
-    return await _quick_list(conn), f"no list named '{title}', so it went to Quick ToDo"
+    raise ValueError(
+        f"No Shared List matches '{title}' (see get_lists). Nothing was added. Leave the "
+        "list empty for Quick ToDo (shared with Michael), or create it with add_list "
+        "(shared with Michael; private=true keeps it James-only).")
 
 
 async def _next_band_rank(conn, ws: str, priority, exclude_id=None) -> float:
-    """routes/shared_lists._next_rank_in_band: the end of the priority band."""
+    """routes/shared_lists._next_rank_in_band: the end of the priority band.
+    The MAX spans both list workspaces (James's merged view); `ws` is where the
+    row lives and is kept in the signature for the callers' clarity."""
+    del ws
     top = await conn.fetchval(
-        "SELECT MAX(rank) FROM shared_list_items WHERE workspace_id = $1 "
+        "SELECT MAX(rank) FROM shared_list_items WHERE workspace_id = ANY($1::text[]) "
         "AND priority IS NOT DISTINCT FROM $2::smallint "
         "AND ($3::uuid IS NULL OR id <> $3::uuid)",
-        ws, priority, exclude_id)
+        _LIST_WORKSPACES, priority, exclude_id)
     return (float(top) if top is not None else 0.0) + _RANK_STEP
 
 
@@ -367,12 +417,14 @@ async def add_task(title: str, list_name: str = "", due_date: str | None = None,
                    source: str | None = None, list_id: str | None = None) -> str:
     """Add a to-do to a SHARED LIST (the old Omnia Lists are retired).
 
-    `list_name` resolves by title across James's list workspaces (shared, plus
-    '<uid>:lists:private' once private mode exists): one exact match, else one
-    partial match; several -> refused (pass list_id); none or empty -> Quick
-    ToDo, and the reply says so. Old names meaning today ("Top to Do Today")
-    land in the Today list, pinned. Priority 1..5 (None = no priority; the Quick
-    ToDo default is P1, like the app's quick-add). Returns '... [id <uuid>]'."""
+    Empty `list_name` -> Quick ToDo (the default inbox, P1 like the app's
+    quick-add). Otherwise it resolves by title across James's list workspaces
+    (shared, plus '<uid>:lists:private' once private mode exists): one exact
+    match, else one partial match; several -> refused (pass list_id); NONE ->
+    refused, nothing added (never silently filed in a list Michael can read).
+    Old names meaning today ("Top to Do Today") land in the Today list. Filing
+    into the Today / Focus list pins the item there. Priority 1..5 (None = no
+    priority). Returns '... [id <uuid>]'."""
     title = (title or "").strip()
     if not title:
         return "Task title is empty."
@@ -390,18 +442,19 @@ async def add_task(title: str, list_name: str = "", due_date: str | None = None,
             exact, _rows = await _lists_matching(conn, name)
             if not exact:
                 alias_note = f"'{name}' is the Today list now"
-                name, pin_today = "Today", True
+                name = "Today"
         try:
-            lst, note = await _resolve_list(conn, name, list_id, fallback_quick=True)
+            lst = await _resolve_list(conn, name, list_id, empty_is_quick=True)
         except ValueError as e:
             return str(e)
+        list_today, list_focus = _pins_for(lst)
+        pin_today, pin_focus = pin_today or list_today, pin_focus or list_focus
         if pr is None and lst["is_quick_default"]:
             pr = QUICK_DEFAULT_PRIORITY
         iid = await _insert_item(conn, lst, title, note=(description or "").strip() or None,
                                  priority=pr, due=due, origin=origin, pin_today=pin_today,
                                  pin_focus=pin_focus)
-    why = "; ".join(n for n in (alias_note, note) if n)
-    why = f" ({why})" if why else ""
+    why = f" ({alias_note})" if alias_note else ""
     return (f"Added task '{title}' to list '{_list_label(lst)}'"
             f"{_added_suffix(pr, due, pin_today, pin_focus)}{why}. [id {iid}]")
 
@@ -535,11 +588,11 @@ def _priority_or_clear(value):
     True) = clear it; 1..5 -> (n, False); anything else -> ValueError."""
     if value is None or (isinstance(value, str) and not value.strip()):
         return None, False
-    try:
-        if int(value) == 0:
-            return None, True
-    except (TypeError, ValueError):
-        pass
+    # Only a real 0 clears: 0.5 or True must not silently wipe a priority.
+    if (type(value) is int and value == 0) or (isinstance(value, str) and value.strip() == "0"):
+        return None, True
+    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+        raise ValueError("priority must be 1..5 (1 = P1, highest), or 0 to clear it.")
     return _priority(value), False
 
 
@@ -580,11 +633,15 @@ async def update_todo(kind: str, item_id: str, text: str | None = None,
     or 0 to clear it (a changed priority parks the item at the end of its new
     band, as the app does). list_id / list_title: move it to another list in the
     SAME workspace (shared <-> private moves are refused here); its subtasks move
-    with it, and a subtask itself cannot be moved alone. pin_today: True
-    pins it to Today (today_date defaults to today in Pacific; today_rank to the
-    end of Today for a fresh pin), False unpins it; today_date / today_rank on
-    their own re-stamp an item. pin_focus: True/False adds it to / takes it out
-    of the Focus bucket. Column names are hard-coded literals; only values are
+    with it, and a subtask itself cannot be moved alone; moving it into the Today
+    / Focus list also pins it there. pin_today: True pins it to Today (today_date
+    defaults to today in Pacific; today_rank to the end of Today for a fresh
+    pin), False unpins it. today_date is only accepted with pin_today=True or on
+    an item already pinned (a bare day stamp would drop the item out of Sweep
+    without showing it in Today); today_rank alone re-orders it within Today.
+    pin_focus: True/False adds it to / takes it out of the Focus bucket. A
+    request whose values already match is a no-op that still returns
+    'Updated.'. Column names are hard-coded literals; only values are
     parameterized."""
     if kind not in ("task", "shared"):
         return "kind must be 'task' or 'shared'."
@@ -599,6 +656,15 @@ async def update_todo(kind: str, item_id: str, text: str | None = None,
         trank = _rank(today_rank)
     except ValueError as e:
         return str(e)
+    moving = bool((list_id or "").strip() or (list_title or "").strip())
+    given = any((
+        text is not None and text.strip(), note is not None and note.strip(),
+        clear_due, due is not None, clear_pr, pr is not None, moving,
+        pin_today is not None, day is not None, trank is not None, pin_focus is not None,
+    ))
+    if not given:
+        return ("Nothing to update (give text, note, due_date, priority, a list, "
+                "pin_today, today_date, today_rank or pin_focus).")
     pool = await _get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -607,6 +673,9 @@ async def update_todo(kind: str, item_id: str, text: str | None = None,
                 if await _is_legacy_task(conn, iid):
                     return _LEGACY_READONLY
                 return "No such item for this user."
+            if day is not None and pin_today is not True and not row["today_pinned"]:
+                return ("today_date needs pin_today=true (or an item already pinned to "
+                        "Today). Nothing was changed.")
             ws = row["workspace_id"]
             sets: list[str] = []
             args: list = [ws, iid]
@@ -629,10 +698,9 @@ async def update_todo(kind: str, item_id: str, text: str | None = None,
                 if new_pr != row["priority"]:
                     put("priority", new_pr, "::smallint")
                     put("rank", await _next_band_rank(conn, ws, new_pr, iid))
-            if (list_id or "").strip() or (list_title or "").strip():
+            if moving:
                 try:
-                    lst, _note = await _resolve_list(conn, list_title, list_id,
-                                                     fallback_quick=False)
+                    lst = await _resolve_list(conn, list_title, list_id, empty_is_quick=False)
                 except ValueError as e:
                     return str(e)
                 if lst["workspace_id"] != ws:
@@ -644,10 +712,11 @@ async def update_todo(kind: str, item_id: str, text: str | None = None,
                         return "That is a subtask; move its parent item instead."
                     put("list_id", lst["id"])
                     move_to = lst["id"]
-            touches_today = pin_today is not None or day is not None or trank is not None
-            if not sets and not touches_today and pin_focus is None:
-                return ("Nothing to update (give text, note, due_date, priority, a list, "
-                        "pin_today, today_date, today_rank or pin_focus).")
+                    list_today, list_focus = _pins_for(lst)
+                    if list_today and pin_today is None:
+                        pin_today = True
+                    if list_focus and pin_focus is None:
+                        pin_focus = True
             if sets:
                 await conn.execute(
                     f"UPDATE shared_list_items SET {', '.join(sets)}, updated_by='james', "
@@ -922,11 +991,13 @@ async def _pin_today(conn, item_id: uuid.UUID, ws: str | None = None, *, day=Non
     Today bucket. `ws` defaults to the shared workspace (the planner's source
     items). An already-pinned item keeps its place; with `restamp` (or an
     explicit day/rank) its day/rank are re-stamped, as the PATCH re-stamps the
-    date. Returns True when the item was newly pinned."""
+    date. Returns True when the item was newly pinned. The end of Today is read
+    across both list workspaces (James's merged Today); the write stays in `ws`,
+    and is_private must match it (defense in depth on top of the DB CHECK)."""
     ws = ws or USER_ID
     row = await conn.fetchrow(
         "SELECT today_pinned FROM shared_list_items WHERE workspace_id=$1 AND id=$2 "
-        "FOR UPDATE", ws, item_id)
+        "AND is_private = $3 FOR UPDATE", ws, item_id, _is_private_ws(ws))
     if row is None:
         return False
     if row["today_pinned"]:
@@ -935,8 +1006,8 @@ async def _pin_today(conn, item_id: uuid.UUID, ws: str | None = None, *, day=Non
         return False
     if rank is None:
         top = await conn.fetchval(
-            "SELECT MAX(today_rank) FROM shared_list_items WHERE workspace_id=$1 "
-            "AND today_pinned", ws)
+            "SELECT MAX(today_rank) FROM shared_list_items "
+            "WHERE workspace_id = ANY($1::text[]) AND today_pinned", _LIST_WORKSPACES)
         rank = (float(top) if top is not None else 0.0) + _RANK_STEP
     await conn.execute(
         f"UPDATE shared_list_items SET today_pinned=true, "
@@ -974,8 +1045,8 @@ async def _pin_focus(conn, item_id, ws: str) -> bool:
     if row is None or row["is_focus"]:
         return False
     top = await conn.fetchval(
-        "SELECT MAX(focus_rank) FROM shared_list_items WHERE workspace_id=$1 AND is_focus "
-        "AND id <> $2", ws, item_id)
+        "SELECT MAX(focus_rank) FROM shared_list_items WHERE workspace_id = ANY($1::text[]) "
+        "AND is_focus AND id <> $2", _LIST_WORKSPACES, item_id)
     await conn.execute(
         "UPDATE shared_list_items SET is_focus=true, focus_rank=$3, updated_by='james', "
         "updated_at=now() WHERE workspace_id=$1 AND id=$2",
@@ -1009,7 +1080,7 @@ async def get_shared_lists(query: str | None = None) -> str:
                        AND i.parent_item_id IS NULL AND NOT i.done) AS open_items
               FROM shared_lists l
               LEFT JOIN shared_projects p
-                ON p.id = l.project_id AND p.workspace_id = l.workspace_id
+                ON p.id = l.project_id AND p.workspace_id = ANY($1::text[])
              WHERE l.workspace_id = ANY($1::text[]) AND l.archived = false
                AND ($2::text = '' OR l.title ILIKE $3 ESCAPE '\')
              ORDER BY l.is_quick_default DESC, (lower(l.title) = 'today') DESC,
@@ -1062,7 +1133,8 @@ async def add_shared_item(list_title: str = "", text: str = "", priority: int | 
     /v1/shared-lists/{id}/items: rank = end of the priority band, position =
     end of the list, created_by/updated_by 'james', origin_by = the write path.
     pin_today also pins it to Today (today_date / today_rank override the day /
-    the order); pin_focus adds it to the Focus bucket."""
+    the order, and need pin_today); pin_focus adds it to the Focus bucket. An
+    item filed in the Today / Focus list is pinned there automatically."""
     text = (text or "").strip()
     if not text:
         return "Item text is empty."
@@ -1078,9 +1150,13 @@ async def add_shared_item(list_title: str = "", text: str = "", priority: int | 
     pool = await _get_pool()
     async with pool.acquire() as conn:
         try:
-            lst, _note = await _resolve_list(conn, list_title, list_id, fallback_quick=False)
+            lst = await _resolve_list(conn, list_title, list_id, empty_is_quick=False)
         except ValueError as e:
             return str(e)
+        list_today, list_focus = _pins_for(lst)
+        pin_today, pin_focus = pin_today or list_today, pin_focus or list_focus
+        if (day is not None or trank is not None) and not pin_today:
+            return "today_date / today_rank need pin_today=true. Nothing was added."
         iid = await _insert_item(conn, lst, text, note=(note or "").strip() or None,
                                  priority=pr, due=due,
                                  origin=_origin(source, "mcp:add_shared_item"),
