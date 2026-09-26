@@ -275,6 +275,23 @@ async def main() -> None:
     check(row["list_id"] == platform["id"], "update_todo moved to Platform")
     r = await w.update_todo("task", str(target), list_title="No Such List Anywhere 42")
     check("No shared list matches" in r, "update_todo unknown list", r)
+    # subtasks move with their parent; a subtask alone cannot be moved
+    sub = uuid.uuid4()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO shared_list_items (id, list_id, parent_item_id, workspace_id, text, "
+            "created_by) VALUES ($1, $2, $3, 'james', $4, 'james')",
+            sub, platform["id"], target, f"{TAG} subtask")
+    CREATED_ITEMS.append(sub)
+    check(await w.update_todo("task", str(target), list_title="Messages") == "Updated.",
+          "move parent with subtask")
+    async with pool.acquire() as conn:
+        sub_list = await conn.fetchval("SELECT list_id FROM shared_list_items WHERE id=$1", sub)
+    check(sub_list == messages["id"], "subtask moved with its parent", sub_list)
+    r = await w.update_todo("task", str(sub), list_title="Platform")
+    check("subtask" in r, "subtask cannot move alone", r)
+    check(await w.update_todo("task", str(target), list_title="Platform") == "Updated.",
+          "move parent back")
     check(await w.update_todo("task", str(target), pin_today=True, today_rank=5.0) == "Updated.",
           "pin via update")
     async with pool.acquire() as conn:

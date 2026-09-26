@@ -518,7 +518,8 @@ _LEGACY_READONLY = ("That is an item in the retired Omnia Lists (hidden in the a
 async def _load_todo(conn, iid, *, for_update: bool = False):
     """ONE shared to-do in James's list workspaces (never a planner row)."""
     return await conn.fetchrow(
-        "SELECT id, text, workspace_id, list_id, priority, done, today_pinned, is_focus "
+        "SELECT id, text, workspace_id, list_id, parent_item_id, priority, done, "
+        "today_pinned, is_focus "
         "FROM shared_list_items WHERE id = $1 AND workspace_id = ANY($2::text[])"
         + (" FOR UPDATE" if for_update else ""),
         iid, _LIST_WORKSPACES)
@@ -578,7 +579,8 @@ async def update_todo(kind: str, item_id: str, text: str | None = None,
     text / note: new values. due_date: 'YYYY-MM-DD', or 'clear'. priority: 1..5,
     or 0 to clear it (a changed priority parks the item at the end of its new
     band, as the app does). list_id / list_title: move it to another list in the
-    SAME workspace (shared <-> private moves are refused here). pin_today: True
+    SAME workspace (shared <-> private moves are refused here); its subtasks move
+    with it, and a subtask itself cannot be moved alone. pin_today: True
     pins it to Today (today_date defaults to today in Pacific; today_rank to the
     end of Today for a fresh pin), False unpins it; today_date / today_rank on
     their own re-stamp an item. pin_focus: True/False adds it to / takes it out
@@ -608,6 +610,7 @@ async def update_todo(kind: str, item_id: str, text: str | None = None,
             ws = row["workspace_id"]
             sets: list[str] = []
             args: list = [ws, iid]
+            move_to = None
 
             def put(col: str, val, cast: str = "") -> None:
                 args.append(val)
@@ -636,7 +639,11 @@ async def update_todo(kind: str, item_id: str, text: str | None = None,
                     return ("Moving an item between shared and private lists isn't supported "
                             "here; use Make private / Share in the app.")
                 if lst["id"] != row["list_id"]:
+                    if row["parent_item_id"] is not None:
+                        # A subtask lives on its parent's list (create_item's rule).
+                        return "That is a subtask; move its parent item instead."
                     put("list_id", lst["id"])
+                    move_to = lst["id"]
             touches_today = pin_today is not None or day is not None or trank is not None
             if not sets and not touches_today and pin_focus is None:
                 return ("Nothing to update (give text, note, due_date, priority, a list, "
@@ -645,6 +652,12 @@ async def update_todo(kind: str, item_id: str, text: str | None = None,
                 await conn.execute(
                     f"UPDATE shared_list_items SET {', '.join(sets)}, updated_by='james', "
                     "updated_at=now() WHERE workspace_id=$1 AND id=$2", *args)
+            if move_to is not None:
+                # Its subtasks move with it, so they stay on their parent's list.
+                await conn.execute(
+                    "UPDATE shared_list_items SET list_id=$3, updated_by='james', "
+                    "updated_at=now() WHERE workspace_id=$1 AND parent_item_id=$2",
+                    ws, iid, move_to)
             if pin_today is True:
                 await _pin_today(conn, iid, ws, day=day, rank=trank, restamp=True)
             elif pin_today is False:
