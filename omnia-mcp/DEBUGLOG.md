@@ -4,6 +4,36 @@ Newest first.
 
 ---
 
+## 2026-09-25: to-dos added through the MCP vanished (they landed in the retired Omnia Lists)
+
+**Symptom:** 4 "URGENT" to-dos added today with `add_task` (plus `add_list` /
+`complete_task` / `update_todo kind=task` edits) never showed up anywhere James
+looks. `add_todo` items sorted last in Top Priorities.
+
+**Context:** planner PR #432 (omnia-platform) hid the old Omnia Lists
+(`omnia_tasks` / `omnia_lists`) and made Shared Lists the only list UI. The MCP
+still INSERTed `add_task` rows into `omnia_tasks` and `add_list` rows into
+`omnia_lists`, so every such write went straight into a hidden table.
+Separately, `add_shared_todo` never set `rank`, so its rows sorted after every
+ranked item in the P1 band.
+
+**Root cause:** the writers were never repointed when the list store changed;
+the old tables still accept inserts, so nothing failed loudly.
+
+**Fix:** every to-do writer targets `shared_list_items` / `shared_lists`
+(Quick ToDo default; list lookup by title across the shared workspace and the
+future `<uid>:lists:private`, ambiguous names refused, unknown -> Quick ToDo),
+with rank/position computed like the backend, provenance in `origin_by`, Today /
+Focus pins, list -> planner done-sync on complete. Legacy ids: complete only.
+Proven on a Neon branch by `tests/integration_shared_writers.py` (88 checks,
+incl. zero new omnia_tasks / omnia_lists rows).
+
+**Prevention:** when a store is retired, grep every writer (MCP, scripts,
+skills, backend) BEFORE hiding its UI, and leave a check that counts new rows in
+the retired table. `tests/integration_shared_writers.py` asserts it.
+
+---
+
 ## 2026-09-25: zoneinfo has no tzdata in the MCP venv; DSN normalizer could emit "?&sslmode"
 
 **Symptom:** while adding `pin_today` (planner follow-ups), importing

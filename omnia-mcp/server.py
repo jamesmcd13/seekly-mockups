@@ -1,14 +1,15 @@
 """
 Omnia MCP server — exposes your live Life-Omnia data to Claude Code.
 
-Reads (omnia_client) are strictly read-only. Writes (omnia_write) are narrow and
-gated: INSERT + a single scoped status-UPDATE only, no DELETE/DDL, scoped to
-user_id, and meant to run behind an agent "propose-then-push" confirmation.
+Reads (omnia_client) are strictly read-only. Writes (omnia_write) are narrow:
+single-row, id-keyed, scoped to James's workspaces, no bulk statements, no DDL;
+deletes run only behind a confirmed target.
 
 Operator tool: pull your real Omnia data (tasks/lists now; pipeline/contacts via
 introspection) on demand for strategy work — separate from the website's code.
 
-Tasks live in Omnia Lists (omnia_lists / omnia_tasks). No Todoist.
+To-dos live in Shared Lists (shared_lists / shared_list_items); the old Omnia
+Lists (omnia_lists / omnia_tasks) are retired and read-only. No Todoist.
 
 Run:  python server.py     (stdio transport — what Claude Code uses)
 Wire: see omnia_client.py + README (read-only Neon role + .env).
@@ -22,21 +23,33 @@ mcp = FastMCP("omnia")
 
 
 @mcp.tool()
-async def get_lists() -> str:
-    """List the user's Omnia lists (To-do and Long Term), excluding archived."""
-    return await omnia.get_lists()
+async def get_lists(include_legacy: bool = False) -> str:
+    """List James's SHARED LISTS (where every to-do lives): title, project, open
+    count, [default] = Quick ToDo, [private] = a private list, and each list's
+    id. The old Omnia Lists are retired (hidden in the app).
+
+    Args:
+        include_legacy: true = also list the retired Omnia Lists (read-only).
+    """
+    return await omnia.get_lists(include_legacy=include_legacy)
 
 
 @mcp.tool()
-async def get_tasks(status: str = "open", list_name: str = "", due: str = "") -> str:
-    """Get the user's Omnia tasks. Pull only what's relevant — not everything.
+async def get_tasks(status: str = "open", list_name: str = "", due: str = "",
+                    include_legacy: bool = False) -> str:
+    """Get James's to-dos from SHARED LISTS. Pull only what's relevant — not
+    everything. Each line ends with the item id (for complete_task /
+    update_todo / delete_todo).
 
     Args:
         status: "open" (default, not done), "done", or "all".
-        list_name: optional list name to filter by (partial match, e.g. "Main St").
-        due: optional — "today", "week", or "overdue".
+        list_name: optional list name to filter by (partial match, e.g. "Quick").
+        due: optional — "today" (due today or earlier, or pinned to Today),
+             "week", or "overdue".
+        include_legacy: true = also show items from the retired Omnia Lists.
     """
-    return await omnia.get_tasks(status=status, list_name=list_name or None, due=due or None)
+    return await omnia.get_tasks(status=status, list_name=list_name or None, due=due or None,
+                                 include_legacy=include_legacy)
 
 
 @mcp.tool()
@@ -94,27 +107,44 @@ async def query(sql: str) -> str:
     return await omnia.run_select(sql)
 
 
-# --- WRITE tools (INSERT + safe status-UPDATE only; no DELETE/DDL) ------------
-# Behavioral contract for agents: PROPOSE the change to the user and get an
-# explicit OK BEFORE calling any of these, then verify with a get_tasks read-back.
+# --- WRITE tools ------------------------------------------------------------------
+# To-dos live in SHARED LISTS only: the old Omnia Lists (omnia_tasks /
+# omnia_lists) are retired and nothing here writes to them (complete_task can
+# still check an old one off). Every write is scoped to James's list workspaces
+# and stamps its provenance in origin_by (`source`, default 'mcp:<tool>').
+# Behavioral contract for agents: adds/edits are reversible; deletes only after
+# the user confirmed the exact target.
 
 @mcp.tool()
-async def add_task(title: str, list_name: str, due_date: str = "",
-                   description: str = "") -> str:
-    """Add a to-do to an existing Omnia list. Propose-then-push: confirm with the
-    user first. Verify afterward with get_tasks.
+async def add_task(title: str, list_name: str = "", due_date: str = "",
+                   description: str = "", priority: int | None = None,
+                   pin_today: bool = False, pin_focus: bool = False,
+                   list_id: str = "", source: str = "") -> str:
+    """Add a to-do to a SHARED LIST (Omnia's one to-do store). With no list, or a
+    list name that doesn't exist, it lands in Quick ToDo (the reply says so).
+    Old list names meaning today ("Top to Do Today") go to the Today list,
+    pinned. Verify afterward with get_tasks.
 
     Args:
-        title: the task text.
-        list_name: an existing list (exact or unique partial match; ambiguous names are rejected).
+        title: the to-do text.
+        list_name: a shared list's title (exact or unique partial match; an
+            ambiguous name is refused, pass list_id). Empty = Quick ToDo.
         due_date: optional 'YYYY-MM-DD'.
         description: optional longer note.
+        priority: optional 1..5 (1 = P1, highest). Quick ToDo defaults to P1.
+        pin_today: true = also pin it to Today.
+        pin_focus: true = also add it to Focus (today's must-dos).
+        list_id: optional list UUID (from get_lists / get_shared_lists); wins.
+        source: optional provenance tag, e.g. 'brain:gv', 'claude:desktop'.
     """
-    return await omniaw.add_task(title, list_name, due_date or None, description or None)
+    return await omniaw.add_task(title, list_name, due_date or None, description or None,
+                                 priority=priority, pin_today=pin_today, pin_focus=pin_focus,
+                                 source=source or None, list_id=list_id or None)
 
 
 @mcp.tool()
-async def add_todo(text: str, priority: int = 1) -> str:
+async def add_todo(text: str, priority: int = 1, pin_today: bool = False,
+                   pin_focus: bool = False, source: str = "") -> str:
     """Add a to-do to the DEFAULT shared quick list (the 'Quick ToDo' shared list).
     This is the default home for an unqualified "add a to-do" / "remind me to X" /
     "put X on my list" when NO specific list is named. For a SPECIFIC named list
@@ -125,45 +155,66 @@ async def add_todo(text: str, priority: int = 1) -> str:
     Args:
         text: the to-do text.
         priority: 1..5, where 1 = P1 (highest). Defaults to 1 (P1).
+        pin_today: true = also pin it to Today.
+        pin_focus: true = also add it to Focus.
+        source: optional provenance tag, e.g. 'brain:gv'.
     """
-    return await omniaw.add_shared_todo(text, priority)
+    return await omniaw.add_shared_todo(text, priority, pin_today=pin_today,
+                                        pin_focus=pin_focus, source=source or None)
 
 
 @mcp.tool()
 async def complete_task(task_id: str) -> str:
-    """Mark an Omnia task done (sets status + logs a completion). Needs the task's
-    UUID. Propose-then-push: confirm with the user first.
+    """Check off ONE to-do (a Shared Lists item: done + done_at, and a planner
+    task planned from it is finished too). An id from the retired Omnia Lists
+    still works. Needs the item's UUID (get_tasks prints it).
 
     Args:
-        task_id: the task UUID (query it via the `query` tool if you only have the title).
+        task_id: the to-do UUID.
     """
     return await omniaw.complete_task(task_id)
 
 
 @mcp.tool()
 async def update_todo(kind: str, item_id: str, text: str = "", due_date: str = "",
-                      priority: int | None = None) -> str:
-    """Edit ONE existing to-do (rename / reschedule / re-prioritize). Only the
-    fields you pass change. Edits are reversible, so no confirmation is needed.
+                      priority: int | None = None, note: str = "", list_id: str = "",
+                      list_title: str = "", pin_today: bool | None = None,
+                      today_date: str = "", today_rank: float | None = None,
+                      pin_focus: bool | None = None) -> str:
+    """Edit ONE existing Shared Lists to-do (rename / reschedule / re-prioritize /
+    move / pin). Only the fields you pass change. Edits are reversible, so no
+    confirmation is needed. Returns 'Updated.' on success.
 
     Args:
-        kind: 'task' for an Omnia task, 'shared' for a shared-list to-do.
-        item_id: the row UUID (find it with the `query` tool by matching text first).
-        text: new text/title (optional).
-        due_date: new due date 'YYYY-MM-DD' (optional).
-        priority: new priority 1..5, 1=P1 (optional).
+        kind: 'task' or 'shared' (both mean a Shared Lists item now; kept for
+            compatibility). Items in the retired Omnia Lists are read-only.
+        item_id: the row UUID (get_tasks prints it).
+        text: new text (optional).
+        due_date: new due date 'YYYY-MM-DD', or 'clear' (optional).
+        priority: new priority 1..5 (1 = P1), or 0 to clear it (optional).
+        note: new note (optional).
+        list_id / list_title: move it to another list (same shared/private side).
+        pin_today: true = pin to Today, false = unpin (optional).
+        today_date: 'YYYY-MM-DD' Today stamp (optional; default today when pinning).
+        today_rank: order within Today, lower = earlier (optional).
+        pin_focus: true = add to Focus, false = remove (optional).
     """
-    return await omniaw.update_todo(kind, item_id, text or None, due_date or None, priority)
+    return await omniaw.update_todo(kind, item_id, text or None, due_date or None, priority,
+                                    note=note or None, list_id=list_id or None,
+                                    list_title=list_title or None, pin_today=pin_today,
+                                    today_date=today_date or None, today_rank=today_rank,
+                                    pin_focus=pin_focus)
 
 
 @mcp.tool()
 async def delete_todo(kind: str, item_id: str) -> str:
-    """DELETE ONE to-do. DESTRUCTIVE: only call after the user has confirmed the
-    exact target with the literal word DELETE. Reversible via DB point-in-time
-    restore, but do not call speculatively.
+    """DELETE ONE Shared Lists to-do (and its subtasks). DESTRUCTIVE: only call
+    after the user has confirmed the exact target with the literal word DELETE.
+    Reversible via DB point-in-time restore, but do not call speculatively.
+    Items in the retired Omnia Lists are refused (read-only).
 
     Args:
-        kind: 'task' for an Omnia task, 'shared' for a shared-list to-do.
+        kind: 'task' or 'shared' (both mean a Shared Lists item now).
         item_id: the row UUID (resolve + echo the exact item to the user first).
     """
     return await omniaw.delete_todo(kind, item_id)
@@ -234,23 +285,28 @@ async def add_contact(name: str, email: str = "", phone: str = "",
 
 
 @mcp.tool()
-async def add_list(name: str, kind: str = "todo") -> str:
-    """Create a new Omnia list (skips duplicates). Propose-then-push: confirm first.
+async def add_list(name: str, kind: str = "todo", project: str = "", source: str = "") -> str:
+    """Create a new SHARED LIST (skips duplicates: an existing list with that
+    title is returned instead). It's visible to Michael, like every shared list.
 
     Args:
         name: list name.
-        kind: 'todo' (default) or 'longterm'.
+        kind: 'todo' (default) or 'longterm' (a standing list); also accepts the
+            Shared Lists kinds main / project / standing.
+        project: optional existing Shared Lists project to file it under.
+        source: optional provenance tag, e.g. 'brain:gv'.
     """
-    return await omniaw.add_list(name, kind)
+    return await omniaw.add_list(name, kind, project or "", source=source or None)
 
 
 
 @mcp.tool()
 async def get_shared_lists(query: str = "") -> str:
-    """List the user's SHARED lists (the /shared-lists page, 'james' workspace):
-    id, title, project, open item count. Also returns `today_list_id` (the list
-    titled "Today") and `quick_todo_list_id` (the Quick ToDo default list), so
-    you can target them by id with add_shared_item(list_id=...). JSON.
+    """List James's SHARED lists (the /shared-lists page, plus his private lists
+    once private mode exists): id, title, project, open item count, private.
+    Also returns `today_list_id` (the list titled "Today"), `quick_todo_list_id`
+    (the Quick ToDo default list), `focus_list_id` and `fathom_list_id`, so you
+    can target them by id with add_shared_item(list_id=...). JSON.
 
     Args:
         query: optional case-insensitive title filter.
@@ -261,10 +317,13 @@ async def get_shared_lists(query: str = "") -> str:
 @mcp.tool()
 async def add_shared_item(list_title: str = "", text: str = "", priority: int | None = None,
                           due_date: str = "", list_id: str = "",
-                          pin_today: bool = False) -> str:
-    """Add an item to a shared list, by `list_id` (exact, from get_shared_lists)
-    or `list_title` (exact, or a unique partial match). Michael can see shared
-    lists. For the default quick list you can also use add_todo.
+                          pin_today: bool = False, pin_focus: bool = False,
+                          today_date: str = "", today_rank: float | None = None,
+                          note: str = "", source: str = "") -> str:
+    """Add an item to ONE named shared list, by `list_id` (exact, from
+    get_shared_lists) or `list_title` (exact, or a unique partial match). No
+    fallback: an unknown list is an error (add_task falls back to Quick ToDo).
+    Michael can see shared lists; private lists are James's only.
 
     Args:
         list_title: the shared list's title (used when list_id is empty).
@@ -275,9 +334,18 @@ async def add_shared_item(list_title: str = "", text: str = "", priority: int | 
         pin_today: true = also pin the new item to Today (the /shared-lists
             TODAY band: today_pinned, today_date = today in Pacific, appended
             at the end of Today's order).
+        pin_focus: true = also add it to Focus (today's must-dos).
+        today_date: optional 'YYYY-MM-DD' Today stamp (with pin_today).
+        today_rank: optional order within Today, lower = earlier (with
+            pin_today; e.g. 1000, 2000, 3000 for a Top 3).
+        note: optional longer note.
+        source: optional provenance tag, e.g. 'claude:plan-day'.
     """
     return await omniaw.add_shared_item(list_title, text, priority, due_date or None,
-                                        list_id or None, pin_today)
+                                        list_id or None, pin_today, pin_focus=pin_focus,
+                                        today_date=today_date or None, today_rank=today_rank,
+                                        note=note or None, source=source or None)
+
 
 
 @mcp.tool()
