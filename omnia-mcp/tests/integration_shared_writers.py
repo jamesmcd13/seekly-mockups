@@ -151,7 +151,7 @@ async def main() -> None:
     r = await w.add_task(f"{TAG} unknown list", "No Such List Anywhere 42")
     async with pool.acquire() as conn:
         n1 = await conn.fetchval("SELECT count(*) FROM shared_list_items")
-    check("No Shared List matches" in r and "Nothing was added" in r and n0 == n1,
+    check("No Shared List matches" in r and "Nothing was written" in r and n0 == n1,
           "add_task unknown list refused", r)
     # 3b. a real third row so later index-based steps keep their meaning
     r = await w.add_task(f"{TAG} third row", "")
@@ -296,6 +296,16 @@ async def main() -> None:
     check(r == "Updated.", "update_todo same-value priority is Updated.", r)
     r = await w.update_todo("task", str(target), list_title="Platform")
     check(r == "Updated.", "update_todo same-list move is Updated.", r)
+    # a move into Today pins it, so today_date is accepted in the same call
+    mover = id_of(await w.add_task(f"{TAG} mover", "Platform"))
+    CREATED_ITEMS.append(mover)
+    r = await w.update_todo("task", str(mover), list_title="Today", today_date="2026-10-11")
+    async with pool.acquire() as conn:
+        row = await one(conn, "SELECT list_id, today_pinned, today_date FROM shared_list_items "
+                              "WHERE id=$1", mover)
+    check(r == "Updated." and row["list_id"] == today["id"] and row["today_pinned"]
+          and str(row["today_date"]) == "2026-10-11", "move into Today pins + today_date", (r, dict(row)))
+    check(await w.update_todo("task", str(mover), priority=0.0) == "Updated.", "priority 0.0 clears")
     # a bare today_date on an unpinned item is refused
     async with pool.acquire() as conn:
         pinned = await conn.fetchval("SELECT today_pinned FROM shared_list_items WHERE id=$1", target)
@@ -460,7 +470,12 @@ async def main() -> None:
     check(", private" in gt, "get_tasks marks private", gt)
     planner_ws_hits = await w.find_todos(f"{TAG} planned")
     check(planner_ws_hits == [], "find_todos never returns planner rows", planner_ws_hits)
-    # add_list(private=True) and a list filed in a PRIVATE project is always private
+    # add_list(private=True) is refused until private mode is live in the app
+    os.environ["OMNIA_PRIVATE_LISTS_LIVE"] = "0"
+    r = await w.add_list(f"{TAG} too early", private=True)
+    check("aren't live" in r and "[id" not in r, "add_list private refused before deploy", r)
+    os.environ["OMNIA_PRIVATE_LISTS_LIVE"] = "1"
+    # ...and once live: private=True, and a list in a PRIVATE project is private
     r = await w.add_list(f"{TAG} private list", private=True)
     plid = id_of(r)
     CREATED_LISTS.append(plid)
@@ -480,6 +495,9 @@ async def main() -> None:
           and "its project is private" in r, "add_list into a private project is private", r)
     r = await w.add_list(f"{TAG} private list", private=True)
     check("already exists" in r and str(plid) in r, "add_list private dedupe", r)
+    os.environ.pop("OMNIA_PRIVATE_LISTS_LIVE", None)
+    # the real probe against the live API answers without raising (fails closed)
+    check(isinstance(await w._private_mode_live(), bool), "private-mode probe runs")
 
     # 22. ambient provenance: env var, then the GV cwd heuristic
     os.environ["OMNIA_MCP_SOURCE"] = "brain:loop"

@@ -301,7 +301,8 @@ async def add_list(name: str, kind: str = "todo", project: str = "", private: bo
             Shared Lists kinds main / project / standing.
         project: optional existing Shared Lists project to file it under.
         private: true = James-only private list (never shown to Michael). A list
-            filed in a private project is always private.
+            filed in a private project is always private. Refused until private
+            mode is live in the app (a private list would be invisible).
         source: optional provenance tag, e.g. 'brain:gv'.
     """
     return await omniaw.add_list(name, kind, project or "", private=private,

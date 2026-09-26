@@ -213,6 +213,39 @@ def _is_private_ws(ws: str) -> bool:
     return (ws or "").endswith(":private")
 
 
+_PRIVATE_LIVE: dict = {"ok": None, "at": 0.0}
+
+
+async def _private_mode_live() -> bool:
+    """True once the backend's private mode is DEPLOYED. Until then the app only
+    reads the shared workspace, so a new private list would be invisible (the
+    very "to-dos vanished" failure this module was repointed to fix), and
+    add_list refuses private=true. Detected from the live API's public OpenAPI
+    schema (the /v1/shared-lists/privacy/... routes). $OMNIA_PRIVATE_LISTS_LIVE
+    = 1 / 0 overrides. A yes is cached for the process, a no for 10 minutes; a
+    probe failure counts as no (fail closed)."""
+    env = (os.environ.get("OMNIA_PRIVATE_LISTS_LIVE") or "").strip()
+    if env in ("0", "1"):
+        return env == "1"
+    import time
+
+    import httpx
+
+    now = time.monotonic()
+    if _PRIVATE_LIVE["ok"] or (_PRIVATE_LIVE["ok"] is False and now - _PRIVATE_LIVE["at"] < 600):
+        return bool(_PRIVATE_LIVE["ok"])
+    base = os.environ.get("OMNIA_API_BASE", "https://api.lifeomnia.com").rstrip("/")
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(f"{base}/openapi.json")
+        paths = r.json().get("paths", {}) if r.status_code == 200 else {}
+        ok = any(p.startswith("/v1/shared-lists/privacy/") for p in paths)
+    except Exception:  # noqa: BLE001 - any failure = not live (fail closed)
+        ok = False
+    _PRIVATE_LIVE.update(ok=ok, at=now)
+    return ok
+
+
 def _priority(value):
     """None/'' -> None; else an int 1..5 (1 = P1, most urgent) or ValueError."""
     if value is None or (isinstance(value, str) and not value.strip()):
@@ -351,9 +384,9 @@ async def _resolve_list(conn, list_title: str | None = None, list_id: str | None
     if len(rows) > 1:
         raise _ambiguous(title, rows)
     raise ValueError(
-        f"No Shared List matches '{title}' (see get_lists). Nothing was added. Leave the "
-        "list empty for Quick ToDo (shared with Michael), or create it with add_list "
-        "(shared with Michael; private=true keeps it James-only).")
+        f"No Shared List matches '{title}' (see get_lists). Nothing was written. For a new "
+        "to-do, leave the list empty for Quick ToDo, or create the list first with add_list "
+        "(both are shared with Michael).")
 
 
 async def _next_band_rank(conn, ws: str, priority, exclude_id=None) -> float:
@@ -438,15 +471,24 @@ async def add_task(title: str, list_name: str = "", due_date: str | None = None,
     async with pool.acquire() as conn:
         name = (list_name or "").strip()
         alias_note = None
+        lst = None
         if not (list_id or "").strip() and name.lower() in _TODAY_ALIASES:
             exact, _rows = await _lists_matching(conn, name)
             if not exact:
-                alias_note = f"'{name}' is the Today list now"
-                name = "Today"
-        try:
-            lst = await _resolve_list(conn, name, list_id, empty_is_quick=True)
-        except ValueError as e:
-            return str(e)
+                # The alias means THE shared Today list (exact title), never a
+                # partial match such as "Today's errands".
+                today, _rows = await _lists_matching(conn, "Today")
+                today = [r for r in today if r["workspace_id"] == USER_ID]
+                if len(today) != 1:
+                    return (f"'{name}' means the Today list, but there is "
+                            f"{'no' if not today else 'more than one'} shared list titled "
+                            "'Today'. Nothing was written.")
+                lst, alias_note = today[0], f"'{name}' is the Today list now"
+        if lst is None:
+            try:
+                lst = await _resolve_list(conn, name, list_id, empty_is_quick=True)
+            except ValueError as e:
+                return str(e)
         list_today, list_focus = _pins_for(lst)
         pin_today, pin_focus = pin_today or list_today, pin_focus or list_focus
         if pr is None and lst["is_quick_default"]:
@@ -589,10 +631,11 @@ def _priority_or_clear(value):
     if value is None or (isinstance(value, str) and not value.strip()):
         return None, False
     # Only a real 0 clears: 0.5 or True must not silently wipe a priority.
-    if (type(value) is int and value == 0) or (isinstance(value, str) and value.strip() == "0"):
-        return None, True
     if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
         raise ValueError("priority must be 1..5 (1 = P1, highest), or 0 to clear it.")
+    if (isinstance(value, (int, float)) and value == 0) or (
+            isinstance(value, str) and value.strip() == "0"):
+        return None, True
     return _priority(value), False
 
 
@@ -673,9 +716,6 @@ async def update_todo(kind: str, item_id: str, text: str | None = None,
                 if await _is_legacy_task(conn, iid):
                     return _LEGACY_READONLY
                 return "No such item for this user."
-            if day is not None and pin_today is not True and not row["today_pinned"]:
-                return ("today_date needs pin_today=true (or an item already pinned to "
-                        "Today). Nothing was changed.")
             ws = row["workspace_id"]
             sets: list[str] = []
             args: list = [ws, iid]
@@ -717,6 +757,11 @@ async def update_todo(kind: str, item_id: str, text: str | None = None,
                         pin_today = True
                     if list_focus and pin_focus is None:
                         pin_focus = True
+            # Checked after a move into Today may have turned the pin on, and
+            # before anything is written (no partial update on refusal).
+            if day is not None and pin_today is not True and not row["today_pinned"]:
+                return ("today_date needs pin_today=true (or an item already pinned to "
+                        "Today). Nothing was changed.")
             if sets:
                 await conn.execute(
                     f"UPDATE shared_list_items SET {', '.join(sets)}, updated_by='james', "
@@ -922,8 +967,9 @@ async def add_list(name: str, kind: str = "todo", project: str = "", *,
     unique partial match; shared or James's private projects); omitted =
     unfiled. private: create it in James's private lists workspace
     ('<uid>:lists:private', invisible to Michael; private mode contract
-    2026-09-25). A list filed in a PRIVATE project is always private. Position is
-    the end of that bucket, as POST /v1/shared-lists does."""
+    2026-09-25), refused until private mode is live in the app. A list filed in
+    a PRIVATE project is always private. Position is the end of that bucket, as
+    POST /v1/shared-lists does."""
     title = (name or "").strip()
     if not title:
         return "List name is empty."
@@ -933,37 +979,43 @@ async def add_list(name: str, kind: str = "todo", project: str = "", *,
     created_by = _origin(source, "mcp:add_list")
     pool = await _get_pool()
     async with pool.acquire() as conn:
+        project_id = project_title = None
+        forced_private = False
+        if (project or "").strip():
+            prows = await conn.fetch(
+                "SELECT id, title, workspace_id FROM shared_projects "
+                "WHERE workspace_id = ANY($1::text[]) AND archived=false "
+                r"AND title ILIKE $2 ESCAPE '\' ORDER BY (workspace_id = $3) DESC, created_at",
+                _LIST_WORKSPACES, _like_arg(project.strip()), USER_ID)
+            pick = ([r for r in prows if r["title"].strip().lower() == project.strip().lower()]
+                    or prows)
+            if not pick:
+                return f"No Shared Lists project matches '{project.strip()}'."
+            if len(pick) > 1:
+                names = ", ".join(f"{r['title']} (id {r['id']})" for r in pick[:8])
+                return f"'{project.strip()}' matches several projects: {names}."
+            project_id, project_title = pick[0]["id"], pick[0]["title"]
+            forced_private = _is_private_ws(pick[0]["workspace_id"]) and not private
+            private = private or _is_private_ws(pick[0]["workspace_id"])
+        # Probed BEFORE the locked transaction (it is a network call).
+        if private and not await _private_mode_live():
+            return ("Private lists aren't live in the app yet, so a private list would be "
+                    "invisible. Nothing was created.")
+        ws = LISTS_PRIVATE_WS if private else USER_ID
         async with conn.transaction():
             # Two racing add_list calls must not both miss the duplicate check.
             await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))",
                                f"{USER_ID}:mcp-add-list")
-            project_id = project_title = None
-            forced_private = False
-            if (project or "").strip():
-                prows = await conn.fetch(
-                    "SELECT id, title, workspace_id FROM shared_projects "
-                    "WHERE workspace_id = ANY($1::text[]) AND archived=false "
-                    r"AND title ILIKE $2 ESCAPE '\' ORDER BY (workspace_id = $3) DESC, created_at",
-                    _LIST_WORKSPACES, _like_arg(project.strip()), USER_ID)
-                pick = ([r for r in prows if r["title"].strip().lower() == project.strip().lower()]
-                        or prows)
-                if not pick:
-                    return f"No Shared Lists project matches '{project.strip()}'."
-                if len(pick) > 1:
-                    names = ", ".join(f"{r['title']} (id {r['id']})" for r in pick[:8])
-                    return f"'{project.strip()}' matches several projects: {names}."
-                project_id, project_title = pick[0]["id"], pick[0]["title"]
-                forced_private = _is_private_ws(pick[0]["workspace_id"]) and not private
-                private = private or _is_private_ws(pick[0]["workspace_id"])
-            ws = LISTS_PRIVATE_WS if private else USER_ID
             dup = await conn.fetchrow(
                 "SELECT id, title FROM shared_lists WHERE workspace_id=$1 AND archived=false "
                 "AND lower(title)=lower($2) ORDER BY created_at LIMIT 1", ws, title)
             if dup:
                 return f"List '{dup['title']}' already exists. [id {dup['id']}]"
+            # End of the bucket across both list workspaces (James's merged view).
             pos = await conn.fetchval(
-                "SELECT COALESCE(MAX(position), -1) + 1 FROM shared_lists WHERE workspace_id=$1 "
-                "AND project_id IS NOT DISTINCT FROM $2::uuid", ws, project_id)
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM shared_lists "
+                "WHERE workspace_id = ANY($1::text[]) "
+                "AND project_id IS NOT DISTINCT FROM $2::uuid", _LIST_WORKSPACES, project_id)
             lid = uuid.uuid4()
             await conn.execute(
                 "INSERT INTO shared_lists (id, workspace_id, project_id, title, kind, position, "
@@ -1040,8 +1092,8 @@ async def _pin_focus(conn, item_id, ws: str) -> bool:
     """PATCH pin_focus=true: is_focus = true and, on a fresh pin, focus_rank at
     the END of the Focus bucket. Returns True when it changed."""
     row = await conn.fetchrow(
-        "SELECT is_focus FROM shared_list_items WHERE workspace_id=$1 AND id=$2 FOR UPDATE",
-        ws, item_id)
+        "SELECT is_focus FROM shared_list_items WHERE workspace_id=$1 AND id=$2 "
+        "AND is_private = $3 FOR UPDATE", ws, item_id, _is_private_ws(ws))
     if row is None or row["is_focus"]:
         return False
     top = await conn.fetchval(
