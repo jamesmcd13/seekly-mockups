@@ -26,6 +26,9 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 DSN = os.environ["OMNIA_DB_DSN"]
 USER_ID = os.environ["OMNIA_USER_ID"]
+# The /contacts book (partner-contacts bucket for James), NOT USER_ID: 'james'
+# is the legacy /contacts-old book. Keep in step with omnia_write.CONTACTS_BUCKET.
+CONTACTS_BUCKET = os.environ.get("OMNIA_CONTACTS_BUCKET", "james_new")
 
 _pool: asyncpg.Pool | None = None
 
@@ -249,16 +252,19 @@ async def get_events(days_ahead: int = 7) -> str:
 
 
 async def get_contacts(query: str | None = None, limit: int = 20) -> str:
-    """Contacts (name, phone, email) for this user, excluding soft-deleted rows.
-    If `query` is given, case-insensitive contains-match on name/email/phone (the
-    LIKE metacharacters % and _ are escaped). Scoped to this user_id."""
+    """Contacts (name, phone, email, id) from the /contacts book: James's own
+    rows (CONTACTS_BUCKET) plus contacts Michael shared, live rows only (the
+    same set GET /v1/partner-contacts lists). If `query` is given,
+    case-insensitive contains-match on name/email/phone (the LIKE
+    metacharacters % and _ are escaped)."""
     try:
         lim = int(limit)
     except (TypeError, ValueError):
         lim = 20
     lim = max(1, min(lim, 200))
-    where = ["user_id = $1", "deleted_at IS NULL"]
-    args: list = [USER_ID]
+    where = ["(user_id = $1 OR visibility = 'shared')", "archived_at IS NULL",
+             "deleted_at IS NULL", "is_active"]
+    args: list = [CONTACTS_BUCKET]
     q = (query or "").strip()
     if q:
         # Escape LIKE wildcards so e.g. "50%" or "a_b" match literally.
@@ -272,7 +278,7 @@ async def get_contacts(query: str | None = None, limit: int = 20) -> str:
         )
     args.append(lim)
     sql = f"""
-        SELECT name, phone, primary_email
+        SELECT id, name, phone, primary_email, user_id
         FROM contacts
         WHERE {' AND '.join(where)}
         ORDER BY name NULLS LAST
@@ -285,7 +291,8 @@ async def get_contacts(query: str | None = None, limit: int = 20) -> str:
     for r in rows:
         phone = f" | {r['phone']}" if r["phone"] else ""
         email = f" | {r['primary_email']}" if r["primary_email"] else ""
-        out.append(f"- {r['name'] or '(no name)'}{phone}{email}")
+        shared = "" if r["user_id"] == CONTACTS_BUCKET else " (shared by Michael)"
+        out.append(f"- {r['name'] or '(no name)'}{phone}{email}{shared} [id {r['id']}]")
     return "\n".join(out)
 
 

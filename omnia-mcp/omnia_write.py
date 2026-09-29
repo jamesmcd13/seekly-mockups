@@ -22,7 +22,9 @@ SAFETY (matches James's production-DB rules):
     complete_task finishes the planner tasks planned from the item
     (source_item_id = id, exact planner workspace). NO bulk delete, NO unscoped
     DELETE/UPDATE, NO DDL, NO TRUNCATE — not anywhere in this file.
-  - Contact "delete" is a SOFT delete (sets deleted_at), never a hard wipe.
+  - Contact "delete" is a SOFT archive (sets archived_at, like the app's own
+    delete), never a hard wipe. Contacts live in the /contacts book
+    (CONTACTS_BUCKET = 'james_new'), never the legacy 'james' book.
   - Every statement is scoped by user_id / workspace_id.
   - Writes are reversible via Neon point-in-time restore.
   - Deletes/edits sit behind the GV brain's DELETE-confirm gate (James echoes the
@@ -51,6 +53,14 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 USER_ID = os.environ["OMNIA_USER_ID"]
+
+# CONTACTS BOOK. The /contacts page reads GET/POST /v1/partner-contacts, whose
+# `contacts_partner._bucket_for` maps James (full access) to the bucket
+# "james_new", NOT USER_ID. The legacy 'james' bucket is /contacts-old and is
+# invisible there, so a contact written under USER_ID never showed up (fixed
+# 2026-09-29). owner_user_id is James's tenant key (USER_ID), exactly as the
+# API stamps it. Keep in step with omnia_client.CONTACTS_BUCKET.
+CONTACTS_BUCKET = os.environ.get("OMNIA_CONTACTS_BUCKET", "james_new")
 
 # Fallback path to the Omnia backend .env (same one omnia_pages.py reads).
 _BACKEND_ENV = Path(os.environ.get(
@@ -582,8 +592,9 @@ async def find_todos(query: str, limit: int = 25, include_legacy: bool = False) 
 
 
 async def find_contacts(query: str, limit: int = 25) -> list[dict]:
-    """Active contacts whose name or email matches `query`.
-    Returns [{id, label}]. Scoped to this user; excludes soft-deleted."""
+    """Live contacts in the /contacts book whose name or email matches `query`.
+    Returns [{id, label}]. Scoped to CONTACTS_BUCKET; excludes archived,
+    soft-deleted and merged-away rows (the app's own live predicate)."""
     q = (query or "").strip()
     if not q:
         return []
@@ -591,10 +602,10 @@ async def find_contacts(query: str, limit: int = 25) -> list[dict]:
     pool = await _get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            r"SELECT id::text AS id, name, primary_email FROM contacts "
-            r"WHERE user_id = $1 AND deleted_at IS NULL "
+            "SELECT id::text AS id, name, primary_email FROM contacts "
+            "WHERE user_id = $1 AND " + _CONTACT_LIVE + " "
             r"AND (name ILIKE $2 ESCAPE '\' OR primary_email ILIKE $2 ESCAPE '\') LIMIT $3",
-            USER_ID, like, limit,
+            CONTACTS_BUCKET, like, limit,
         )
     return [{"id": r["id"],
              "label": r["name"] or r["primary_email"] or r["id"]} for r in rows]
@@ -785,50 +796,145 @@ async def update_todo(kind: str, item_id: str, text: str | None = None,
     return "Updated."
 
 
+# --- CONTACTS: mirror GET/POST/PATCH/DELETE /v1/partner-contacts --------------
+# omnia-platform backend/app/routes/contacts_partner.py is the contract:
+#   * bucket  user_id = 'james_new', owner_user_id = James's tenant key; book /
+#     visibility / tags keep their server defaults ('curated' / 'private' / []),
+#     i.e. a hand-entered row, exactly what the UI's Add contact makes.
+#   * email   stripped + lowercased. uq_contacts_user_email (user_id,
+#     primary_email) is NOT partial, so a NON-live holder (archived, deleted or
+#     merged-away) gives its email up (set NULL) and a LIVE holder is a conflict
+#     (_claim_email_slot). add_contact MERGES into a live holder instead.
+#   * live    archived_at IS NULL AND deleted_at IS NULL AND is_active.
+#   * delete  archived_at = now() + dismiss the contact's open 'manual'
+#     follow-up reminders, like the API. The API also hard-deletes the owner's
+#     contact_activity + extras sidecars; that is irreversible, so it is NOT
+#     done here: an archived row keeps its history and can be restored.
+# Only rows in James's OWN book are edited or archived. A contact Michael
+# shared (visibility 'shared', his bucket) is never touched from here.
+
+_CONTACT_LIVE = "archived_at IS NULL AND deleted_at IS NULL AND is_active"
+
+
+def _clean_email(v: str | None) -> str | None:
+    v = (v or "").strip().lower()
+    return v or None
+
+
+def _clean_field(v: str | None) -> str | None:
+    v = (v or "").strip()
+    return v or None
+
+
+def _phone10(v: str | None) -> str | None:
+    """Last 10 digits, so '(626) 555-0100' == '+16265550100'. None if < 10."""
+    d = re.sub(r"\D", "", v or "")
+    return d[-10:] if len(d) >= 10 else None
+
+
+async def _release_email(conn, email: str, exclude_id: uuid.UUID | None = None) -> None:
+    """Free `email` in the contacts book from NON-live holders (the API's
+    _claim_email_slot release). Callers have already ruled out a live holder.
+    Bounded: uq_contacts_user_email allows one row per exact address; lower()
+    also catches a legacy mixed-case spelling."""
+    await conn.execute(
+        "UPDATE contacts SET primary_email = NULL "
+        "WHERE user_id = $1 AND lower(primary_email) = $2 "
+        "AND id IS DISTINCT FROM $3 AND NOT (" + _CONTACT_LIVE + ")",
+        CONTACTS_BUCKET, email, exclude_id)
+
+
 async def soft_delete_contact(contact_id: str) -> str:
-    """SOFT-delete a contact (sets deleted_at + is_active=false), scoped to user.
-    Recoverable; never a hard wipe."""
+    """Archive ONE contact in the /contacts book (sets archived_at, like the
+    app's delete). Recoverable (clear archived_at); never a hard wipe."""
     try:
         cid = uuid.UUID(str(contact_id))
     except ValueError:
         return "contact_id must be a valid UUID."
     pool = await _get_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT name FROM contacts WHERE user_id=$1 AND id=$2 AND deleted_at IS NULL",
-            USER_ID, cid)
-        if row is None:
-            return "No such active contact for this user."
-        await conn.execute(
-            "UPDATE contacts SET deleted_at=now(), is_active=false, updated_at=now() "
-            "WHERE user_id=$1 AND id=$2", USER_ID, cid)
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT name, visibility FROM contacts WHERE user_id=$1 AND id=$2 AND "
+                + _CONTACT_LIVE + " FOR UPDATE", CONTACTS_BUCKET, cid)
+            if row is None:
+                return "No such active contact in the /contacts book."
+            if row["visibility"] == "shared":
+                return (f"'{row['name']}' is shared with Michael; delete it in the app "
+                        "(it audits who deleted a shared contact). Nothing changed.")
+            await conn.execute(
+                "UPDATE contacts SET archived_at=now(), updated_at=now() "
+                "WHERE user_id=$1 AND id=$2", CONTACTS_BUCKET, cid)
+            await conn.execute(
+                "UPDATE reminders SET dismissed_at=now() WHERE user_id=$1 AND contact_id=$2 "
+                "AND source='manual' AND completed_at IS NULL AND dismissed_at IS NULL",
+                CONTACTS_BUCKET, cid)
     return f"Deleted contact '{row['name']}'."
 
 
 async def update_contact(contact_id: str, name: str | None = None, phone: str | None = None,
                          email: str | None = None, company: str | None = None,
-                         notes: str | None = None) -> str:
-    """Edit ONE contact the caller owns. Only provided fields change. Column names
-    are hard-coded literals; only values are parameterized."""
+                         notes: str | None = None, append_notes: bool = False) -> str:
+    """Edit ONE live contact in the /contacts book. Only provided fields change
+    (PATCH semantics). Column names are hard-coded literals; only values are
+    parameterized. An email already on another live contact is refused.
+    append_notes=True adds `notes` as a new line under the existing notes
+    (read on the row-locked contact, so nothing can be overwritten)."""
     try:
         cid = uuid.UUID(str(contact_id))
     except ValueError:
         return "contact_id must be a valid UUID."
-    fields = {"name": name, "phone": phone, "primary_email": email,
-              "company": company, "notes": notes}
+    if name is not None and not name.strip():
+        return "Name cannot be empty."
+    fields = {"name": name, "phone": phone, "company": company}
+    if not append_notes:
+        fields["notes"] = notes
     sets, args = [], []
     for col, val in fields.items():
-        if val is not None:
-            args.append(val.strip()); sets.append(f"{col}=${len(args)}")
-    if not sets:
+        if val is not None and _clean_field(val) is not None:
+            args.append(_clean_field(val)); sets.append(f"{col}=${len(args)}")
+    add_note = _clean_field(notes) if append_notes else None
+    new_email = _clean_email(email)
+    if not sets and new_email is None and add_note is None:
         return "Nothing to update."
-    args.extend([USER_ID, cid])
-    sql = (f"UPDATE contacts SET {', '.join(sets)}, updated_at=now() "
-           f"WHERE user_id=${len(args) - 1} AND id=${len(args)} AND deleted_at IS NULL")
     pool = await _get_pool()
-    async with pool.acquire() as conn:
-        status = await conn.execute(sql, *args)
-    return "Updated." if status.endswith(" 1") else "No such active contact for this user."
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT primary_email, notes FROM contacts WHERE user_id=$1 AND id=$2 AND "
+                    + _CONTACT_LIVE + " FOR UPDATE", CONTACTS_BUCKET, cid)
+                if row is None:
+                    return "No such active contact in the /contacts book."
+                if add_note is not None:
+                    cur = (row["notes"] or "").rstrip()
+                    args.append(f"{cur}\n{add_note}" if cur else add_note)
+                    sets.append(f"notes=${len(args)}")
+                # Exact compare: a case-only change ('Foo@x.com' -> 'foo@x.com')
+                # still normalizes the stored value to lowercase.
+                if new_email is not None and new_email != row["primary_email"]:
+                    clash = await conn.fetchrow(
+                        "SELECT name FROM contacts WHERE user_id=$1 AND lower(primary_email)=$2 "
+                        "AND id<>$3 AND " + _CONTACT_LIVE, CONTACTS_BUCKET, new_email, cid)
+                    if clash:
+                        return (f"{new_email} already belongs to '{clash['name']}'. "
+                                "Nothing changed.")
+                    await _release_email(conn, new_email, cid)
+                    args.append(new_email); sets.append(f"primary_email=${len(args)}")
+                if not sets:
+                    return "Nothing to update."
+                args.extend([CONTACTS_BUCKET, cid])
+                try:
+                    async with conn.transaction():  # savepoint: a racing email claim must not 500
+                        await conn.execute(
+                            f"UPDATE contacts SET {', '.join(sets)}, updated_at=now() "
+                            f"WHERE user_id=${len(args) - 1} AND id=${len(args)}", *args)
+                except asyncpg.UniqueViolationError:
+                    # roll back the whole edit (incl. the email release), not only the UPDATE
+                    raise _Refused(f"{new_email} was just taken by another contact. Nothing changed.")
+        return "Updated."
+    except _Refused as e:
+        return str(e)
 
 
 async def complete_task(task_id: str) -> str:
@@ -929,32 +1035,112 @@ async def create_event(title: str, start_at: str, end_at: str | None = None,
         "Create the appointment on the Outlook or Google calendar instead.")
 
 
+def _same_name(a: str | None, b: str | None) -> bool:
+    """Case- and whitespace-insensitive equality. A merge needs the SAME name:
+    a shared email/phone (a couple's joint inbox, a family landline) must never
+    fold one person's details into somebody else's contact."""
+    def norm(v):
+        return " ".join((v or "").lower().split())
+    return bool(norm(a)) and norm(a) == norm(b)
+
+
+def _refuse_other(handle: str, rows) -> str:
+    """No-write answer when the email/phone is on a contact with another name,
+    or on several contacts. Ids use '(id ...)' not '[id ...]': callers (the GV
+    brain) read '[id ...]' as 'written', and nothing was."""
+    who = "; ".join(f"'{r['name']}' (id {r['id']})" for r in rows)
+    return (f"{handle} is already on {who}. Not adding a duplicate; if it is the "
+            "same person, edit that contact with update_contact.")
+
+
+async def _merge_into(conn, row, email: str | None, phone: str | None,
+                      company: str | None, notes: str | None) -> str:
+    """Fill the existing contact's BLANK fields and append new notes. Never
+    overwrites a value already there (name, email, phone, company)."""
+    sets, args, merged = [], [], []
+    if email and not row["primary_email"]:
+        await _release_email(conn, email, row["id"])
+        args.append(email); sets.append(f"primary_email=${len(args)}"); merged.append("email")
+    if phone and not row["phone"]:
+        args.append(phone); sets.append(f"phone=${len(args)}"); merged.append("phone")
+    if company and not row["company"]:
+        args.append(company); sets.append(f"company=${len(args)}"); merged.append("company")
+    old_notes = row["notes"] or ""
+    if notes and notes.strip() and notes.strip() not in old_notes:
+        args.append(f"{old_notes.rstrip()}\n\n{notes}" if old_notes.strip() else notes)
+        sets.append(f"notes=${len(args)}"); merged.append("notes")
+    label = f"'{row['name']}' [id {row['id']}]"
+    if not sets:
+        return f"Already in contacts as {label}. Nothing new to add."
+    args.extend([CONTACTS_BUCKET, row["id"]])
+    await conn.execute(
+        f"UPDATE contacts SET {', '.join(sets)}, updated_at=now() "
+        f"WHERE user_id=${len(args) - 1} AND id=${len(args)}", *args)
+    return f"Already in contacts as {label}; merged {', '.join(merged)} (no duplicate made)."
+
+
+class _Refused(Exception):
+    """Abort the whole transaction (incl. any email release) with a message."""
+
+
 async def add_contact(name: str, email: str | None = None, phone: str | None = None,
                       company: str | None = None, notes: str | None = None) -> str:
-    if not name.strip():
+    """Add a contact to the /contacts book the way POST /v1/partner-contacts
+    does. Dedup: a live contact with the same email (or, when no email is
+    given, the same 10-digit phone) AND the same name is MERGED into (blank
+    fields filled, notes appended) instead of duplicated. The same email/phone
+    on a differently named contact, or on several, is refused; nothing written."""
+    name = (name or "").strip()
+    if not name:
         return "Contact name is empty."
+    email, phone, company = _clean_email(email), _clean_field(phone), _clean_field(company)
+    notes = notes or None  # the API stores notes as sent
+    cols = "id, name, primary_email, phone, company, notes"
     pool = await _get_pool()
-    cid = uuid.uuid4()
-    async with pool.acquire() as conn:
-        if email:
-            dup = await conn.fetchrow(
-                "SELECT name FROM contacts WHERE user_id=$1 AND lower(primary_email)=lower($2) "
-                "AND deleted_at IS NULL",
-                USER_ID, email,
-            )
-            if dup:
-                return f"A contact with {email} already exists ('{dup['name']}'). Not adding a duplicate."
-        await conn.execute(
-            """
-            INSERT INTO contacts
-                (id, user_id, name, primary_email, phone, company, notes,
-                 is_active, created_at, updated_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,true,now(),now())
-            """,
-            cid, USER_ID, name.strip(), email, phone, company, notes,
-        )
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                if email:
+                    dups = await conn.fetch(
+                        f"SELECT {cols} FROM contacts WHERE user_id=$1 AND lower(primary_email)=$2 "
+                        "AND " + _CONTACT_LIVE + " ORDER BY created_at LIMIT 5 FOR UPDATE",
+                        CONTACTS_BUCKET, email)
+                    handle = email
+                elif _phone10(phone):
+                    dups = await conn.fetch(
+                        f"SELECT {cols} FROM contacts WHERE user_id=$1 "
+                        r"AND right(regexp_replace(coalesce(phone, ''), '\D', '', 'g'), 10) = $2 "
+                        "AND " + _CONTACT_LIVE + " ORDER BY created_at LIMIT 5 FOR UPDATE",
+                        CONTACTS_BUCKET, _phone10(phone))
+                    handle = phone
+                else:
+                    dups, handle = [], ""
+                if len(dups) == 1 and _same_name(dups[0]["name"], name):
+                    return await _merge_into(conn, dups[0], email, phone, company, notes)
+                if dups:
+                    return _refuse_other(handle, dups)
+                if email:
+                    await _release_email(conn, email)
+                cid = uuid.uuid4()
+                try:
+                    async with conn.transaction():  # savepoint
+                        await conn.execute(
+                            """
+                            INSERT INTO contacts
+                                (id, user_id, owner_user_id, name, primary_email, phone,
+                                 company, notes, created_at, updated_at)
+                            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now(),now())
+                            """,
+                            cid, CONTACTS_BUCKET, USER_ID, name, email, phone, company, notes,
+                        )
+                except asyncpg.UniqueViolationError:
+                    # A racing insert took the email: roll back the release too.
+                    raise _Refused(f"A contact with {email} was just added. "
+                                   "Not adding a duplicate.")
+    except _Refused as e:
+        return str(e)
     bits = ", ".join(b for b in (email, phone, company) if b)
-    return f"Added contact '{name.strip()}'" + (f" ({bits})" if bits else "") + f". [id {cid}]"
+    return f"Added contact '{name}'" + (f" ({bits})" if bits else "") + f". [id {cid}]"
 
 
 async def add_list(name: str, kind: str = "todo", project: str = "", *,

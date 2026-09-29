@@ -4,6 +4,51 @@ Newest first.
 
 ---
 
+## 2026-09-29: contacts added through the MCP never appeared on /contacts
+
+**Symptom:** `add_contact` returned "Added contact ..." but the person never
+showed on the /contacts page; the /add skill had to route contacts to a to-do
+instead.
+
+**Context:** the /contacts page is the partner-contacts surface
+(`GET/POST /v1/partner-contacts`, omnia-platform
+`backend/app/routes/contacts_partner.py`). Its `_bucket_for` maps James to the
+`contacts.user_id` bucket `"james_new"` (the "new curated book": 10 hand-entered
++ 1,552 promoted by `import_legacy_contacts.py` on 08-12). The MCP scoped every
+contact read/write by `OMNIA_USER_ID` = `"james"`, which is the LEGACY book now
+shown only at /contacts-old.
+
+**Tried:** checked the legacy bucket for MCP-written rows since the 08-12
+import: none (the only new rows, 3 on 08-31, came from the BlueBubbles sync,
+`contact_identifiers.source='bluebubbles'`). So the bug was latent: nothing was
+lost yet, but the next MCP add would have vanished.
+
+**Root cause:** the contacts store split into two buckets (Aug 2026) and the MCP
+was never repointed; the old bucket still accepts inserts, so nothing failed.
+Same class as the 2026-09-25 retired-Omnia-Lists entry below.
+
+**Fix:** `CONTACTS_BUCKET = "james_new"` (env override
+`OMNIA_CONTACTS_BUCKET`). add/update/soft_delete/find_contacts + get_contacts
+mirror the API: owner_user_id='james', book/visibility/tags server defaults,
+lowercased email, live = archived_at/deleted_at NULL + is_active, non-live
+holders release their email, delete = archived_at + dismiss open manual
+follow-ups. Deliberate differences: add MERGES into a live same-email (or,
+without email, same 10-digit phone) contact with the SAME name instead of 409
+(other name or several matches -> refused, nothing written); update_contact
+gains append_notes (appends on the row-locked contact); delete keeps the
+activity/extras sidecars (reversible) and refuses shared rows; edits never touch
+Michael's shared rows. Proven by `tests/rollback_contacts_bucket.py` (prod, one
+transaction, always rolled back; 34 checks).
+
+**Prevention:** any store keyed by a bucket that is NOT the tenant key needs
+the bucket named once (constant) and a test that counts rows written to the old
+bucket (the rollback test asserts zero). When a backend adds a second book,
+grep the MCP + scripts for `user_id` writers to that table.
+
+**Tags:** #contacts #bucket #james_new #mcp #silent-wrong-target
+
+---
+
 ## 2026-09-25: to-dos added through the MCP vanished (they landed in the retired Omnia Lists)
 
 **Symptom:** 4 "URGENT" to-dos added today with `add_task` (plus `add_list` /
