@@ -66,8 +66,8 @@ async def get_events(days_ahead: int = 7) -> str:
 
 @mcp.tool()
 async def get_contacts(query: str = "", limit: int = 20) -> str:
-    """Look up the user's contacts (read-only): returns name, phone, email.
-    Excludes soft-deleted contacts. Use for "find Sarah's number", "what's Bob's
+    """Look up the user's contacts (read-only) in the /contacts book: returns
+    name, phone, email and the contact id. Live contacts only. Use for "find Sarah's number", "what's Bob's
     email", etc.
 
     Args:
@@ -226,21 +226,26 @@ async def delete_todo(kind: str, item_id: str) -> str:
 
 @mcp.tool()
 async def update_contact(contact_id: str, name: str = "", phone: str = "",
-                         email: str = "", company: str = "", notes: str = "") -> str:
+                         email: str = "", company: str = "", notes: str = "",
+                         append_notes: bool = False) -> str:
     """Edit ONE existing contact. Only the fields you pass change. Reversible; no
     confirmation needed.
 
     Args:
-        contact_id: the contact UUID (find it with the `query` tool first).
+        contact_id: the contact UUID (find it with get_contacts first).
         name/phone/email/company/notes: new values (pass only what changes).
+        append_notes: true = add the notes text as a new line under the existing notes
+               (preferred); false = notes REPLACES the existing notes.
     """
     return await omniaw.update_contact(contact_id, name or None, phone or None,
-                                       email or None, company or None, notes or None)
+                                       email or None, company or None, notes or None,
+                                       append_notes=append_notes)
 
 
 @mcp.tool()
 async def delete_contact(contact_id: str) -> str:
-    """SOFT-DELETE ONE contact (recoverable; sets deleted_at). DESTRUCTIVE-ish:
+    """ARCHIVE ONE contact (recoverable; sets archived_at, like the app's
+    delete). Contacts shared with Michael are refused. DESTRUCTIVE-ish:
     only call after the user confirmed the exact contact with the word DELETE.
 
     Args:
@@ -274,8 +279,11 @@ async def create_event(title: str, start_at: str, end_at: str = "",
 @mcp.tool()
 async def add_contact(name: str, email: str = "", phone: str = "",
                       company: str = "", notes: str = "") -> str:
-    """Add a contact to Omnia (skips exact-email duplicates). Propose-then-push:
-    confirm with the user first. Note: no birthday column — put dates in notes.
+    """Add a contact to the Omnia /contacts page. Dedup: an existing contact
+    with the same email (or, with no email, the same phone) is updated instead:
+    its blank fields are filled and the notes appended; nothing is overwritten.
+    Propose-then-push: confirm with the user first. Note: no birthday column —
+    put dates in notes.
 
     Args:
         name: full name.
