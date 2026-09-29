@@ -91,7 +91,7 @@ async def main() -> None:
         # 2b. same email + same name (case/space-insensitive) -> merge, no duplicate
         msg = await w.add_contact(f"  zz test   {tag} ", f"  {email}  ", "+19999999999", "Acme",
                                   "birthday 3/4")
-        check("merged company, notes" in msg, f"merge: {msg}")
+        check("merged company, notes" in msg and "Kept existing phone" in msg, f"merge: {msg}")
         n = await conn.fetchval("SELECT count(*) FROM contacts WHERE lower(primary_email)=$1", email)
         r = await conn.fetchrow("SELECT * FROM contacts WHERE id=$1", cid)
         check(n == 1, "no duplicate on same email")
@@ -151,6 +151,14 @@ async def main() -> None:
         check(msg.startswith("No such active contact"), "legacy 'james' row unreachable by update")
         msg = await w.soft_delete_contact(str(legacy_id))
         check(msg.startswith("No such active contact"), "legacy 'james' row unreachable by delete")
+        mid = uuid.uuid4()
+        await conn.execute(
+            "INSERT INTO contacts (id, user_id, owner_user_id, name, visibility) "
+            "VALUES ($1,'partner:zz-test','zz-test',$2,'shared')", mid, f"ZZ Shared {tag}")
+        msg = await w.update_contact(str(mid), notes="no")
+        check("Michael shared" in msg, f"shared-by-Michael update explained: {msg}")
+        msg = await w.soft_delete_contact(str(mid))
+        check("Michael shared" in msg, f"shared-by-Michael delete explained: {msg}")
 
         # 6. delete: shared refused; own archived; email released on re-add
         await conn.execute("UPDATE contacts SET visibility='shared' WHERE id=$1", cid)

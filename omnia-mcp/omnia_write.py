@@ -835,13 +835,25 @@ def _phone10(v: str | None) -> str | None:
 async def _release_email(conn, email: str, exclude_id: uuid.UUID | None = None) -> None:
     """Free `email` in the contacts book from NON-live holders (the API's
     _claim_email_slot release). Callers have already ruled out a live holder.
-    Bounded: uq_contacts_user_email allows one row per exact address; lower()
-    also catches a legacy mixed-case spelling."""
+    Exact address, like the API: uq_contacts_user_email is on the exact
+    value, so a differently-cased non-live holder never blocks and is left
+    alone. Bounded to at most one row."""
     await conn.execute(
         "UPDATE contacts SET primary_email = NULL "
-        "WHERE user_id = $1 AND lower(primary_email) = $2 "
+        "WHERE user_id = $1 AND primary_email = $2 "
         "AND id IS DISTINCT FROM $3 AND NOT (" + _CONTACT_LIVE + ")",
         CONTACTS_BUCKET, email, exclude_id)
+
+
+async def _not_found(conn, cid: uuid.UUID) -> str:
+    """Why a contact id did not resolve in James's own book."""
+    shared = await conn.fetchval(
+        "SELECT name FROM contacts WHERE id=$1 AND user_id<>$2 AND visibility='shared' AND "
+        + _CONTACT_LIVE, cid, CONTACTS_BUCKET)
+    if shared is not None:
+        return (f"'{shared}' is a contact Michael shared; edit or delete it in the app. "
+                "Nothing changed.")
+    return "No such active contact in the /contacts book."
 
 
 async def soft_delete_contact(contact_id: str) -> str:
@@ -858,7 +870,7 @@ async def soft_delete_contact(contact_id: str) -> str:
                 "SELECT name, visibility FROM contacts WHERE user_id=$1 AND id=$2 AND "
                 + _CONTACT_LIVE + " FOR UPDATE", CONTACTS_BUCKET, cid)
             if row is None:
-                return "No such active contact in the /contacts book."
+                return await _not_found(conn, cid)
             if row["visibility"] == "shared":
                 return (f"'{row['name']}' is shared with Michael; delete it in the app "
                         "(it audits who deleted a shared contact). Nothing changed.")
@@ -905,7 +917,7 @@ async def update_contact(contact_id: str, name: str | None = None, phone: str | 
                     "SELECT primary_email, notes FROM contacts WHERE user_id=$1 AND id=$2 AND "
                     + _CONTACT_LIVE + " FOR UPDATE", CONTACTS_BUCKET, cid)
                 if row is None:
-                    return "No such active contact in the /contacts book."
+                    return await _not_found(conn, cid)
                 if add_note is not None:
                     cur = (row["notes"] or "").rstrip()
                     args.append(f"{cur}\n{add_note}" if cur else add_note)
@@ -931,7 +943,8 @@ async def update_contact(contact_id: str, name: str | None = None, phone: str | 
                             f"WHERE user_id=${len(args) - 1} AND id=${len(args)}", *args)
                 except asyncpg.UniqueViolationError:
                     # roll back the whole edit (incl. the email release), not only the UPDATE
-                    raise _Refused(f"{new_email} was just taken by another contact. Nothing changed.")
+                    raise _Refused(f"{new_email or 'That email'} was just taken by another "
+                                   "contact. Nothing changed.")
         return "Updated."
     except _Refused as e:
         return str(e)
@@ -1053,30 +1066,37 @@ def _refuse_other(handle: str, rows) -> str:
             "same person, edit that contact with update_contact.")
 
 
-async def _merge_into(conn, row, email: str | None, phone: str | None,
-                      company: str | None, notes: str | None) -> str:
+async def _merge_into(conn, row, phone: str | None, company: str | None,
+                      notes: str | None) -> str:
     """Fill the existing contact's BLANK fields and append new notes. Never
-    overwrites a value already there (name, email, phone, company)."""
-    sets, args, merged = [], [], []
-    if email and not row["primary_email"]:
-        await _release_email(conn, email, row["id"])
-        args.append(email); sets.append(f"primary_email=${len(args)}"); merged.append("email")
+    overwrites a value already there; a different incoming phone/company is
+    reported back (kept) so the caller can decide to update_contact it. (The
+    row matched on this email, or has none when matched by phone, so email
+    never needs filling.)"""
+    sets, args, merged, kept = [], [], [], []
     if phone and not row["phone"]:
         args.append(phone); sets.append(f"phone=${len(args)}"); merged.append("phone")
+    elif phone and _phone10(phone) != _phone10(row["phone"]) and phone != row["phone"]:
+        kept.append(f"phone {row['phone']} (you sent {phone})")
     if company and not row["company"]:
         args.append(company); sets.append(f"company=${len(args)}"); merged.append("company")
+    elif company and company.lower() != (row["company"] or "").lower():
+        kept.append(f"company {row['company']} (you sent {company})")
     old_notes = row["notes"] or ""
     if notes and notes.strip() and notes.strip() not in old_notes:
         args.append(f"{old_notes.rstrip()}\n\n{notes}" if old_notes.strip() else notes)
         sets.append(f"notes=${len(args)}"); merged.append("notes")
     label = f"'{row['name']}' [id {row['id']}]"
+    tail = (f" Kept existing {'; '.join(kept)}; use update_contact to change it."
+            if kept else "")
     if not sets:
-        return f"Already in contacts as {label}. Nothing new to add."
+        return f"Already in contacts as {label}. Nothing new to add.{tail}"
     args.extend([CONTACTS_BUCKET, row["id"]])
     await conn.execute(
         f"UPDATE contacts SET {', '.join(sets)}, updated_at=now() "
         f"WHERE user_id=${len(args) - 1} AND id=${len(args)}", *args)
-    return f"Already in contacts as {label}; merged {', '.join(merged)} (no duplicate made)."
+    return (f"Already in contacts as {label}; merged {', '.join(merged)} "
+            f"(no duplicate made).{tail}")
 
 
 class _Refused(Exception):
@@ -1116,7 +1136,7 @@ async def add_contact(name: str, email: str | None = None, phone: str | None = N
                 else:
                     dups, handle = [], ""
                 if len(dups) == 1 and _same_name(dups[0]["name"], name):
-                    return await _merge_into(conn, dups[0], email, phone, company, notes)
+                    return await _merge_into(conn, dups[0], phone, company, notes)
                 if dups:
                     return _refuse_other(handle, dups)
                 if email:

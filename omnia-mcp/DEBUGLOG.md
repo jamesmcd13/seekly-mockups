@@ -38,7 +38,7 @@ without email, same 10-digit phone) contact with the SAME name instead of 409
 gains append_notes (appends on the row-locked contact); delete keeps the
 activity/extras sidecars (reversible) and refuses shared rows; edits never touch
 Michael's shared rows. Proven by `tests/rollback_contacts_bucket.py` (prod, one
-transaction, always rolled back; 34 checks).
+transaction, always rolled back; 36 checks).
 
 **Prevention:** any store keyed by a bucket that is NOT the tenant key needs
 the bucket named once (constant) and a test that counts rows written to the old
