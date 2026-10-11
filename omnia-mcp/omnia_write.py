@@ -22,13 +22,22 @@ SAFETY (matches James's production-DB rules):
     complete_task finishes the planner tasks planned from the item
     (source_item_id = id, exact planner workspace). NO bulk delete, NO unscoped
     DELETE/UPDATE, NO DDL, NO TRUNCATE — not anywhere in this file.
-  - Contact "delete" is a SOFT archive (sets archived_at, like the app's own
-    delete), never a hard wipe. Contacts live in the /contacts book
+  - TRASH BIN (omnia-platform PR #612, migration 4246a236b358). Deletes are
+    SOFT: delete_todo stamps deleted_at on the item and its live direct subtasks
+    (one shared timestamp, the third bounded family); restore_todo clears it.
+    Contact delete puts a private contact in the Trash (deleted_at) and HIDES a
+    shared one for James only (contact_hides), as the app does. The backend
+    purge hard-deletes Trash rows after TRASH_RETENTION_DAYS (30); nothing here
+    ever hard-deletes a to-do or a contact. Contacts live in the /contacts book
     (CONTACTS_BUCKET = 'james_new'), never the legacy 'james' book.
+  - EVERY read of shared_list_items / shared_lists filters deleted_at IS NULL
+    (alias-qualified), the same as the backend's global hide filter; only the
+    trash/restore paths read trashed rows on purpose. Contact reads exclude
+    rows James hid (_NOT_HIDDEN).
   - Every statement is scoped by user_id / workspace_id.
   - Writes are reversible via Neon point-in-time restore.
-  - Deletes/edits sit behind the GV brain's DELETE-confirm gate (James echoes the
-    exact target and replies the literal word DELETE). This module just executes.
+  - Deletes need a normal confirmation of the exact target (the item goes to
+    the Trash and can be restored for 30 days). This module just executes.
 
 Creds (never in code/chat):
   Prefers OMNIA_DB_DSN_RW; else DATABASE_URL / OMNIA_DATABASE_URL; else reads
@@ -324,7 +333,8 @@ async def _list_by_id(conn, list_id: str):
         raise ValueError("list_id must be a UUID (see get_shared_lists).")
     row = await conn.fetchrow(
         f"SELECT {_LIST_COLS} {_LIST_FROM} WHERE l.id = $1 "
-        "AND l.workspace_id = ANY($2::text[]) AND l.archived = false",
+        "AND l.workspace_id = ANY($2::text[]) AND l.archived = false "
+        "AND l.deleted_at IS NULL",
         lid, _LIST_WORKSPACES)
     if row is None:
         raise ValueError(f"No shared list with id {list_id} (see get_shared_lists).")
@@ -334,11 +344,16 @@ async def _list_by_id(conn, list_id: str):
 async def _quick_list(conn):
     """Quick ToDo, resolved like the backend's _ensure_quick_list: the list
     flagged is_quick_default (rename-proof; an ARCHIVED flagged list is
-    un-archived, as the backend does, because it still owns the one-per-workspace
-    slot), else the oldest list titled 'Quick ToDo' (adopt-by-title)."""
+    un-archived and a TRASHED one is restored with the items trashed with it,
+    as the backend does, because it still owns the one-per-workspace slot),
+    else the oldest live list titled 'Quick ToDo' (adopt-by-title). The flagged
+    lookup is the one list read that sees trashed rows on purpose."""
     row = await conn.fetchrow(
-        f"SELECT {_LIST_COLS} {_LIST_FROM} WHERE l.workspace_id = $1 "
+        f"SELECT {_LIST_COLS}, l.deleted_at {_LIST_FROM} WHERE l.workspace_id = $1 "
         "AND l.is_quick_default ORDER BY l.created_at LIMIT 1", USER_ID)
+    if row is not None and row["deleted_at"] is not None:
+        async with conn.transaction():
+            await _restore_list_rows(conn, USER_ID, row["id"], row["deleted_at"])
     if row is not None and row["archived"]:
         await conn.execute(
             "UPDATE shared_lists SET archived = false, updated_at = now() "
@@ -346,7 +361,8 @@ async def _quick_list(conn):
     if row is None:
         row = await conn.fetchrow(
             f"SELECT {_LIST_COLS} {_LIST_FROM} WHERE l.workspace_id = $1 "
-            "AND l.archived = false AND lower(l.title) = 'quick todo' "
+            "AND l.archived = false AND l.deleted_at IS NULL "
+            "AND lower(l.title) = 'quick todo' "
             "ORDER BY l.created_at LIMIT 1", USER_ID)
     if row is None:
         raise ValueError("No Quick ToDo list found (open /shared-lists once to create it).")
@@ -359,7 +375,7 @@ async def _lists_matching(conn, title: str):
     lists sort before private ones, oldest first."""
     rows = await conn.fetch(
         f"SELECT {_LIST_COLS} {_LIST_FROM} WHERE l.workspace_id = ANY($1::text[]) "
-        r"AND l.archived = false AND l.title ILIKE $2 ESCAPE '\' "
+        r"AND l.archived = false AND l.deleted_at IS NULL AND l.title ILIKE $2 ESCAPE '\' "
         "ORDER BY (l.workspace_id = $3) DESC, l.created_at",
         _LIST_WORKSPACES, _like_arg(title), USER_ID)
     t = title.strip().lower()
@@ -407,7 +423,7 @@ async def _next_band_rank(conn, ws: str, priority, exclude_id=None) -> float:
     top = await conn.fetchval(
         "SELECT MAX(rank) FROM shared_list_items WHERE workspace_id = ANY($1::text[]) "
         "AND priority IS NOT DISTINCT FROM $2::smallint "
-        "AND ($3::uuid IS NULL OR id <> $3::uuid)",
+        "AND ($3::uuid IS NULL OR id <> $3::uuid) AND deleted_at IS NULL",
         _LIST_WORKSPACES, priority, exclude_id)
     return (float(top) if top is not None else 0.0) + _RANK_STEP
 
@@ -423,7 +439,8 @@ async def _insert_item(conn, lst, text: str, *, note=None, priority=None, due=No
     async with conn.transaction():
         rank = await _next_band_rank(conn, ws, priority)
         pos = await conn.fetchval(
-            "SELECT COALESCE(MAX(position), -1) + 1 FROM shared_list_items WHERE list_id = $1",
+            "SELECT COALESCE(MAX(position), -1) + 1 FROM shared_list_items WHERE list_id = $1 "
+            "AND deleted_at IS NULL",
             lst["id"])
         await conn.execute(
             "INSERT INTO shared_list_items (id, list_id, workspace_id, is_private, text, note, "
@@ -573,6 +590,7 @@ async def find_todos(query: str, limit: int = 25, include_legacy: bool = False) 
               FROM shared_list_items i
               JOIN shared_lists l ON l.id = i.list_id AND l.workspace_id = i.workspace_id
              WHERE i.workspace_id = ANY($1::text[]) AND i.done = false AND l.archived = false
+               AND i.deleted_at IS NULL AND l.deleted_at IS NULL
                AND i.text ILIKE $2 ESCAPE '\'
              ORDER BY i.created_at DESC
              LIMIT $3
@@ -594,7 +612,8 @@ async def find_todos(query: str, limit: int = 25, include_legacy: bool = False) 
 async def find_contacts(query: str, limit: int = 25) -> list[dict]:
     """Live contacts in the /contacts book whose name or email matches `query`.
     Returns [{id, label}]. Scoped to CONTACTS_BUCKET; excludes archived,
-    soft-deleted and merged-away rows (the app's own live predicate)."""
+    trashed and merged-away rows (the app's own live predicate) and shared rows
+    James hid."""
     q = (query or "").strip()
     if not q:
         return []
@@ -603,7 +622,7 @@ async def find_contacts(query: str, limit: int = 25) -> list[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT id::text AS id, name, primary_email FROM contacts "
-            "WHERE user_id = $1 AND " + _CONTACT_LIVE + " "
+            "WHERE user_id = $1 AND " + _CONTACT_LIVE + " AND " + _NOT_HIDDEN + " "
             r"AND (name ILIKE $2 ESCAPE '\' OR primary_email ILIKE $2 ESCAPE '\') LIMIT $3",
             CONTACTS_BUCKET, like, limit,
         )
@@ -622,11 +641,13 @@ _LEGACY_READONLY = ("That is an item in the retired Omnia Lists (hidden in the a
 
 
 async def _load_todo(conn, iid, *, for_update: bool = False):
-    """ONE shared to-do in James's list workspaces (never a planner row)."""
+    """ONE live (not trashed) shared to-do in James's list workspaces (never a
+    planner row)."""
     return await conn.fetchrow(
         "SELECT id, text, workspace_id, list_id, parent_item_id, priority, done, "
         "today_pinned, is_focus "
-        "FROM shared_list_items WHERE id = $1 AND workspace_id = ANY($2::text[])"
+        "FROM shared_list_items WHERE id = $1 AND workspace_id = ANY($2::text[]) "
+        "AND deleted_at IS NULL"
         + (" FOR UPDATE" if for_update else ""),
         iid, _LIST_WORKSPACES)
 
@@ -651,10 +672,14 @@ def _priority_or_clear(value):
 
 
 async def delete_todo(kind: str, item_id: str) -> str:
-    """Hard-delete ONE shared to-do (its subtasks cascade; a planner task planned
-    from it just loses its source link). Reversible via Neon PITR. Sits behind
-    the GV brain's DELETE-confirm gate. kind 'task' or 'shared' (both mean a
-    Shared Lists item now); a retired Omnia-Lists id is refused, never deleted."""
+    """Move ONE shared to-do to the Trash (soft delete, like the app's DELETE
+    /v1/shared-lists/items/{id}): deleted_at = one timestamp on the item AND
+    its not-yet-trashed direct subtasks, so restore_todo brings them back
+    together. Waits that named any of them as their blocker keep only their
+    blocker text (what the old hard delete's ON DELETE SET NULL did; the app
+    then releases those waiters). Restorable for TRASH_RETENTION_DAYS; the
+    backend purge removes it after that. kind 'task' or 'shared' (both mean a
+    Shared Lists item now); a retired Omnia-Lists id is refused."""
     if kind not in ("task", "shared"):
         return "kind must be 'task' or 'shared'."
     iid = _uuid_or_none(item_id)
@@ -667,11 +692,178 @@ async def delete_todo(kind: str, item_id: str) -> str:
             if row is None:
                 if await _is_legacy_task(conn, iid):
                     return _LEGACY_READONLY
+                if await _trashed_todo(conn, iid) is not None:
+                    return "That to-do is already in the Trash (restore_todo brings it back)."
                 return "No such to-do for this user."
+            ws = row["workspace_id"]
+            now = await _db_now(conn)
             await conn.execute(
-                "DELETE FROM shared_list_items WHERE workspace_id = $1 AND id = $2",
-                row["workspace_id"], iid)
-    return f"Deleted to-do '{row['text']}'."
+                "UPDATE shared_list_items SET deleted_at = $3 "
+                "WHERE workspace_id = $1 AND id = $2 AND deleted_at IS NULL", ws, iid, now)
+            subs = await conn.fetch(
+                "UPDATE shared_list_items SET deleted_at = $3 "
+                "WHERE workspace_id = $1 AND parent_item_id = $2 AND deleted_at IS NULL "
+                "RETURNING id", ws, iid, now)
+            await conn.execute(
+                "UPDATE item_waits SET blocker_item_id = NULL "
+                "WHERE blocker_item_id = ANY($1::uuid[])", [iid, *(r["id"] for r in subs)])
+    extra = f" (and {_plural(len(subs), 'subtask')})" if subs else ""
+    return (f"Moved to-do '{row['text']}'{extra} to the Trash. It can be restored for "
+            f"{TRASH_RETENTION_DAYS} days (restore_todo).")
+
+
+# --- TRASH: restore + list (mirrors services/trash.py in omnia-platform) -------
+# A delete stamps ONE deleted_at on the row and everything trashed with it; that
+# shared timestamp is the grouping key. Restore clears it on exactly the rows
+# stamped in the same delete; a child trashed on its own earlier keeps its own
+# timestamp and stays in the Trash. Only these functions read trashed rows.
+
+TRASH_RETENTION_DAYS = max(1, int(os.environ.get("TRASH_RETENTION_DAYS", "30") or 30))
+
+
+async def _trashed_todo(conn, iid, *, for_update: bool = False):
+    """ONE trashed shared to-do in James's list workspaces."""
+    return await conn.fetchrow(
+        "SELECT id, text, workspace_id, list_id, parent_item_id, deleted_at "
+        "FROM shared_list_items WHERE id = $1 AND workspace_id = ANY($2::text[]) "
+        "AND deleted_at IS NOT NULL" + (" FOR UPDATE" if for_update else ""),
+        iid, _LIST_WORKSPACES)
+
+
+async def _restore_list_rows(conn, ws: str, list_id, ts) -> int:
+    """Un-trash ONE list and the items trashed with it (same deleted_at).
+    Returns the item count. Bounded: keyed by the list id + its timestamp."""
+    status = await conn.execute(
+        "UPDATE shared_list_items SET deleted_at = NULL "
+        "WHERE workspace_id = $1 AND list_id = $2 AND deleted_at = $3", ws, list_id, ts)
+    await conn.execute(
+        "UPDATE shared_lists SET deleted_at = NULL WHERE workspace_id = $1 AND id = $2",
+        ws, list_id)
+    return int(status.split()[-1])
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}{'' if n == 1 else 's'}"
+
+
+async def restore_todo(item_id: str) -> str:
+    """Bring ONE to-do back from the Trash: clears deleted_at on the item and on
+    the subtasks trashed with it (exact same timestamp). If its parent item or
+    its list is trashed too, that row is restored as well (only the row itself),
+    so the to-do has somewhere visible to live. A trashed LIST id restores the
+    list and the items trashed with it. Ids come from list_trash."""
+    iid = _uuid_or_none(item_id)
+    if iid is None:
+        return "item_id must be a valid UUID (see list_trash)."
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await _trashed_todo(conn, iid, for_update=True)
+            if row is None:
+                lst = await conn.fetchrow(
+                    "SELECT id, title, workspace_id, deleted_at FROM shared_lists "
+                    "WHERE id = $1 AND workspace_id = ANY($2::text[]) "
+                    "AND deleted_at IS NOT NULL FOR UPDATE", iid, _LIST_WORKSPACES)
+                if lst is not None:
+                    n = await _restore_list_rows(conn, lst["workspace_id"], iid,
+                                                 lst["deleted_at"])
+                    extra = f" with {_plural(n, 'item')}" if n else ""
+                    return f"Restored list '{lst['title']}'{extra} from the Trash."
+                if await _load_todo(conn, iid) is not None:
+                    return "That to-do is not in the Trash."
+                return "No such to-do or list in the Trash (see list_trash)."
+            ws, ts = row["workspace_id"], row["deleted_at"]
+            await conn.execute(
+                "UPDATE shared_list_items SET deleted_at = NULL "
+                "WHERE workspace_id = $1 AND id = $2", ws, iid)
+            status = await conn.execute(
+                "UPDATE shared_list_items SET deleted_at = NULL "
+                "WHERE workspace_id = $1 AND parent_item_id = $2 AND deleted_at = $3",
+                ws, iid, ts)
+            n = int(status.split()[-1])
+            also = []
+            if row["parent_item_id"] is not None:
+                status = await conn.execute(
+                    "UPDATE shared_list_items SET deleted_at = NULL WHERE workspace_id = $1 "
+                    "AND id = $2 AND deleted_at IS NOT NULL", ws, row["parent_item_id"])
+                if status.endswith(" 1"):
+                    also.append("its parent item")
+            title = await conn.fetchrow(
+                "UPDATE shared_lists SET deleted_at = NULL WHERE workspace_id = $1 "
+                "AND id = $2 AND deleted_at IS NOT NULL RETURNING title", ws, row["list_id"])
+            if title is not None:
+                also.append(f"its list '{title['title']}'")
+    extra = f" (and {_plural(n, 'subtask')})" if n else ""
+    tail = f"; {' and '.join(also)} came back too" if also else ""
+    return f"Restored to-do '{row['text']}'{extra} from the Trash{tail}."
+
+
+def _trash_entry(type_: str, id_, title, deleted_at, context, child_count: int) -> dict:
+    return {"type": type_, "id": str(id_), "title": title or "",
+            "deleted_at": _iso(deleted_at),
+            "purge_at": _iso(deleted_at + timedelta(days=TRASH_RETENTION_DAYS)
+                             if deleted_at is not None else None),
+            "context": context, "child_count": child_count}
+
+
+async def list_trash() -> str:
+    """What is in James's Trash inside the retention window, newest first:
+    to-dos and lists in his list workspaces (never the planner), plus contacts
+    (fully trashed ones he can see, and shared ones he hid: hidden_only). A
+    subtask trashed with its parent, or an item trashed with its list, is
+    folded into that entry's child_count, as the app's Trash page shows it.
+    JSON."""
+    days = TRASH_RETENTION_DAYS
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        items = await conn.fetch(
+            "SELECT i.id, i.text, i.list_id, i.parent_item_id, i.deleted_at, "
+            "l.title AS list_title, l.deleted_at AS list_deleted_at "
+            "FROM shared_list_items i LEFT JOIN shared_lists l ON l.id = i.list_id "
+            "WHERE i.workspace_id = ANY($1::text[]) "
+            "AND i.deleted_at >= now() - make_interval(days => $2)",
+            _LIST_WORKSPACES, days)
+        lists = await conn.fetch(
+            "SELECT l.id, l.title, l.deleted_at FROM shared_lists l "
+            "WHERE l.workspace_id = ANY($1::text[]) "
+            "AND l.deleted_at >= now() - make_interval(days => $2)",
+            _LIST_WORKSPACES, days)
+        contacts = await conn.fetch(
+            "SELECT c.id, c.name, c.primary_email, c.company, c.deleted_at FROM contacts c "
+            "WHERE (c.user_id = $1 OR c.visibility = 'shared') AND c.merged_into IS NULL "
+            "AND c.deleted_at >= now() - make_interval(days => $2)",
+            CONTACTS_BUCKET, days)
+        hidden = await conn.fetch(
+            "SELECT c.id, c.name, c.primary_email, c.company, h.hidden_at "
+            "FROM contact_hides h JOIN contacts c ON c.id = h.contact_id "
+            "WHERE h.owner_key = $1 AND c.deleted_at IS NULL "
+            "AND h.hidden_at >= now() - make_interval(days => $2)",
+            _HIDE_KEY, days)
+    by_id = {r["id"]: r for r in items}
+    out = []
+    for r in items:
+        parent = by_id.get(r["parent_item_id"])
+        if parent is not None and parent["deleted_at"] == r["deleted_at"]:
+            continue  # folded under its parent
+        if r["list_deleted_at"] is not None and r["list_deleted_at"] == r["deleted_at"]:
+            continue  # folded under its list
+        kids = sum(1 for c in items
+                   if c["parent_item_id"] == r["id"] and c["deleted_at"] == r["deleted_at"])
+        out.append(_trash_entry("todo", r["id"], r["text"], r["deleted_at"], r["list_title"], kids))
+    for lst in lists:
+        kids = sum(1 for i in items
+                   if i["list_id"] == lst["id"] and i["deleted_at"] == lst["deleted_at"])
+        out.append(_trash_entry("list", lst["id"], lst["title"], lst["deleted_at"], None, kids))
+    for c in contacts:
+        out.append(_trash_entry("contact", c["id"], c["name"] or c["primary_email"],
+                                c["deleted_at"], c["company"], 0))
+    for c in hidden:
+        e = _trash_entry("contact", c["id"], c["name"] or c["primary_email"], c["hidden_at"],
+                         c["company"], 0)
+        e["hidden_only"] = True
+        out.append(e)
+    out.sort(key=lambda e: e["deleted_at"] or "", reverse=True)
+    return _json.dumps({"retention_days": days, "entries": out}, indent=1)
 
 
 async def update_todo(kind: str, item_id: str, text: str | None = None,
@@ -806,14 +998,25 @@ async def update_todo(kind: str, item_id: str, text: str | None = None,
 #     merged-away) gives its email up (set NULL) and a LIVE holder is a conflict
 #     (_claim_email_slot). add_contact MERGES into a live holder instead.
 #   * live    archived_at IS NULL AND deleted_at IS NULL AND is_active.
-#   * delete  archived_at = now() + dismiss the contact's open 'manual'
-#     follow-up reminders, like the API. The API also hard-deletes the owner's
-#     contact_activity + extras sidecars; that is irreversible, so it is NOT
-#     done here: an archived row keeps its history and can be restored.
-# Only rows in James's OWN book are edited or archived. A contact Michael
-# shared (visibility 'shared', his bucket) is never touched from here.
+#   * delete  (Trash bin, services/contact_hides.py + contacts_partner delete)
+#     A PRIVATE contact in James's book: deleted_at = now() (Trash) and its open
+#     'manual' follow-up reminders are dismissed with the SAME timestamp (the
+#     app's restore re-opens exactly those). A SHARED contact (James's or one
+#     Michael shared): a contact_hides row for James only (audited as 'delete'
+#     in contact_share_activity); the contact goes to the Trash only once every
+#     party has hidden it (the owner plus one other key, v1 2-tenant rule).
+#     Sidecars are never touched.
+#   * hidden  a shared contact James hid is invisible to him (_NOT_HIDDEN).
+# Edits only touch rows in James's OWN book. A contact Michael shared
+# (visibility 'shared', his bucket) is never edited from here, only hidden.
 
 _CONTACT_LIVE = "archived_at IS NULL AND deleted_at IS NULL AND is_active"
+# James's tenant key for contact_hides.owner_key (the backend's DEFAULT_USER_ID,
+# 'james' for both of his buckets). USER_ID is validated as a plain slug above,
+# so embedding it as a SQL literal is safe.
+_HIDE_KEY = USER_ID
+_NOT_HIDDEN = ("NOT EXISTS (SELECT 1 FROM contact_hides ch WHERE ch.contact_id = contacts.id "
+               f"AND ch.owner_key = '{_HIDE_KEY}')")
 
 
 def _clean_email(v: str | None) -> str | None:
@@ -849,39 +1052,73 @@ async def _not_found(conn, cid: uuid.UUID) -> str:
     """Why a contact id did not resolve in James's own book."""
     shared = await conn.fetchval(
         "SELECT name FROM contacts WHERE id=$1 AND user_id<>$2 AND visibility='shared' AND "
-        + _CONTACT_LIVE, cid, CONTACTS_BUCKET)
+        + _CONTACT_LIVE + " AND " + _NOT_HIDDEN, cid, CONTACTS_BUCKET)
     if shared is not None:
         return (f"'{shared}' is a contact Michael shared; edit or delete it in the app. "
                 "Nothing changed.")
     return "No such active contact in the /contacts book."
 
 
+def _owner_key_for_bucket(bucket: str) -> str:
+    """contact_hides.owner_key_for_bucket: the tenant key owning a bucket.
+    James's buckets ('james', 'james_new') -> 'james'; 'partner:<sub>' -> sub."""
+    if bucket in (USER_ID, CONTACTS_BUCKET):
+        return _HIDE_KEY
+    if bucket.startswith("partner:"):
+        return bucket[len("partner:"):]
+    return bucket
+
+
 async def soft_delete_contact(contact_id: str) -> str:
-    """Archive ONE contact in the /contacts book (sets archived_at, like the
-    app's delete). Recoverable (clear archived_at); never a hard wipe."""
+    """Delete ONE contact James can see, the way the app does (Trash bin):
+    a PRIVATE contact in his book goes to the Trash (deleted_at; its open
+    manual follow-ups are dismissed with the same timestamp); a SHARED contact
+    is hidden for James only (contact_hides) and reaches the Trash only once the
+    other party has hidden it too. Restorable from the Trash for 30 days;
+    never a hard wipe."""
     try:
         cid = uuid.UUID(str(contact_id))
     except ValueError:
         return "contact_id must be a valid UUID."
     pool = await _get_pool()
+    days = TRASH_RETENTION_DAYS
     async with pool.acquire() as conn:
         async with conn.transaction():
             row = await conn.fetchrow(
-                "SELECT name, visibility FROM contacts WHERE user_id=$1 AND id=$2 AND "
-                + _CONTACT_LIVE + " FOR UPDATE", CONTACTS_BUCKET, cid)
+                "SELECT name, visibility, user_id FROM contacts WHERE id=$2 AND "
+                "(user_id=$1 OR visibility='shared') AND " + _CONTACT_LIVE + " AND "
+                + _NOT_HIDDEN + " FOR UPDATE", CONTACTS_BUCKET, cid)
             if row is None:
-                return await _not_found(conn, cid)
+                return "No such active contact in the /contacts book."
+            now = await _db_now(conn)
             if row["visibility"] == "shared":
-                return (f"'{row['name']}' is shared with Michael; delete it in the app "
-                        "(it audits who deleted a shared contact). Nothing changed.")
+                await conn.execute(
+                    "INSERT INTO contact_hides (contact_id, owner_key, hidden_at) "
+                    "VALUES ($1, $2, $3) ON CONFLICT (contact_id, owner_key) "
+                    "DO UPDATE SET hidden_at = EXCLUDED.hidden_at", cid, _HIDE_KEY, now)
+                await conn.execute(
+                    "INSERT INTO contact_share_activity (contact_id, actor_user_id, action, "
+                    "from_visibility, to_visibility) VALUES ($1, $2, 'delete', 'shared', NULL)",
+                    cid, _HIDE_KEY)
+                keys = {r["owner_key"] for r in await conn.fetch(
+                    "SELECT owner_key FROM contact_hides WHERE contact_id = $1", cid)}
+                owner = _owner_key_for_bucket(row["user_id"])
+                if owner in keys and any(k != owner for k in keys):
+                    await conn.execute(
+                        "UPDATE contacts SET deleted_at=$2 WHERE id=$1 AND deleted_at IS NULL",
+                        cid, now)
+                    return (f"Moved shared contact '{row['name']}' to the Trash (both of you "
+                            f"have now deleted it). It can be restored for {days} days.")
+                return (f"Removed shared contact '{row['name']}' from your view; the other "
+                        f"person still has it. Restorable from the Trash for {days} days.")
             await conn.execute(
-                "UPDATE contacts SET archived_at=now(), updated_at=now() "
-                "WHERE user_id=$1 AND id=$2", CONTACTS_BUCKET, cid)
+                "UPDATE contacts SET deleted_at=$3 WHERE user_id=$1 AND id=$2",
+                CONTACTS_BUCKET, cid, now)
             await conn.execute(
-                "UPDATE reminders SET dismissed_at=now() WHERE user_id=$1 AND contact_id=$2 "
+                "UPDATE reminders SET dismissed_at=$3 WHERE user_id=$1 AND contact_id=$2 "
                 "AND source='manual' AND completed_at IS NULL AND dismissed_at IS NULL",
-                CONTACTS_BUCKET, cid)
-    return f"Deleted contact '{row['name']}'."
+                CONTACTS_BUCKET, cid, now)
+    return f"Moved contact '{row['name']}' to the Trash. It can be restored for {days} days."
 
 
 async def update_contact(contact_id: str, name: str | None = None, phone: str | None = None,
@@ -915,7 +1152,8 @@ async def update_contact(contact_id: str, name: str | None = None, phone: str | 
             async with conn.transaction():
                 row = await conn.fetchrow(
                     "SELECT primary_email, notes FROM contacts WHERE user_id=$1 AND id=$2 AND "
-                    + _CONTACT_LIVE + " FOR UPDATE", CONTACTS_BUCKET, cid)
+                    + _CONTACT_LIVE + " AND " + _NOT_HIDDEN + " FOR UPDATE",
+                    CONTACTS_BUCKET, cid)
                 if row is None:
                     return await _not_found(conn, cid)
                 if add_note is not None:
@@ -996,7 +1234,8 @@ async def _complete_linked_planner_tasks(conn, item_id, now: datetime) -> int:
     the exact private planner workspace. Returns how many tasks changed."""
     rows = await conn.fetch(
         f"SELECT {_ITEM_COLS} FROM shared_list_items WHERE workspace_id=$1 AND is_private "
-        "AND parent_item_id IS NOT NULL AND source_item_id=$2 FOR UPDATE",
+        "AND parent_item_id IS NOT NULL AND source_item_id=$2 AND deleted_at IS NULL "
+        "FOR UPDATE",
         PLANNER_WS, item_id)
     changed = 0
     for t in rows:
@@ -1136,10 +1375,27 @@ async def add_contact(name: str, email: str | None = None, phone: str | None = N
                 else:
                     dups, handle = [], ""
                 if len(dups) == 1 and _same_name(dups[0]["name"], name):
+                    # Re-adding a shared contact James hid shows it to him again.
+                    await conn.execute(
+                        "DELETE FROM contact_hides WHERE contact_id=$1 AND owner_key=$2",
+                        dups[0]["id"], _HIDE_KEY)
                     return await _merge_into(conn, dups[0], phone, company, notes)
                 if dups:
                     return _refuse_other(handle, dups)
                 if email:
+                    # Re-adding a contact that is in the Trash restores it (the
+                    # app's revive_trashed) instead of stripping its email.
+                    trashed = await conn.fetchrow(
+                        f"SELECT {cols} FROM contacts WHERE user_id=$1 AND primary_email=$2 "
+                        "AND deleted_at IS NOT NULL AND archived_at IS NULL "
+                        "AND merged_into IS NULL AND is_active FOR UPDATE",
+                        CONTACTS_BUCKET, email)
+                    if trashed is not None and _same_name(trashed["name"], name):
+                        await conn.execute(
+                            "UPDATE contacts SET deleted_at=NULL, updated_at=now() "
+                            "WHERE user_id=$1 AND id=$2", CONTACTS_BUCKET, trashed["id"])
+                        msg = await _merge_into(conn, trashed, phone, company, notes)
+                        return "Restored from the Trash. " + msg
                     await _release_email(conn, email)
                 cid = uuid.uuid4()
                 try:
@@ -1214,13 +1470,14 @@ async def add_list(name: str, kind: str = "todo", project: str = "", *,
                                f"{USER_ID}:mcp-add-list")
             dup = await conn.fetchrow(
                 "SELECT id, title FROM shared_lists WHERE workspace_id=$1 AND archived=false "
-                "AND lower(title)=lower($2) ORDER BY created_at LIMIT 1", ws, title)
+                "AND deleted_at IS NULL AND lower(title)=lower($2) ORDER BY created_at LIMIT 1",
+                ws, title)
             if dup:
                 return f"List '{dup['title']}' already exists. [id {dup['id']}]"
             # End of the bucket across both list workspaces (James's merged view).
             pos = await conn.fetchval(
                 "SELECT COALESCE(MAX(position), -1) + 1 FROM shared_lists "
-                "WHERE workspace_id = ANY($1::text[]) "
+                "WHERE workspace_id = ANY($1::text[]) AND deleted_at IS NULL "
                 "AND project_id IS NOT DISTINCT FROM $2::uuid", _LIST_WORKSPACES, project_id)
             lid = uuid.uuid4()
             await conn.execute(
@@ -1255,7 +1512,7 @@ async def _pin_today(conn, item_id: uuid.UUID, ws: str | None = None, *, day=Non
     ws = ws or USER_ID
     row = await conn.fetchrow(
         "SELECT today_pinned FROM shared_list_items WHERE workspace_id=$1 AND id=$2 "
-        "AND is_private = $3 FOR UPDATE", ws, item_id, _is_private_ws(ws))
+        "AND is_private = $3 AND deleted_at IS NULL FOR UPDATE", ws, item_id, _is_private_ws(ws))
     if row is None:
         return False
     if row["today_pinned"]:
@@ -1265,7 +1522,8 @@ async def _pin_today(conn, item_id: uuid.UUID, ws: str | None = None, *, day=Non
     if rank is None:
         top = await conn.fetchval(
             "SELECT MAX(today_rank) FROM shared_list_items "
-            "WHERE workspace_id = ANY($1::text[]) AND today_pinned", _LIST_WORKSPACES)
+            "WHERE workspace_id = ANY($1::text[]) AND today_pinned AND deleted_at IS NULL",
+            _LIST_WORKSPACES)
         rank = (float(top) if top is not None else 0.0) + _RANK_STEP
     await conn.execute(
         f"UPDATE shared_list_items SET today_pinned=true, "
@@ -1299,12 +1557,12 @@ async def _pin_focus(conn, item_id, ws: str) -> bool:
     the END of the Focus bucket. Returns True when it changed."""
     row = await conn.fetchrow(
         "SELECT is_focus FROM shared_list_items WHERE workspace_id=$1 AND id=$2 "
-        "AND is_private = $3 FOR UPDATE", ws, item_id, _is_private_ws(ws))
+        "AND is_private = $3 AND deleted_at IS NULL FOR UPDATE", ws, item_id, _is_private_ws(ws))
     if row is None or row["is_focus"]:
         return False
     top = await conn.fetchval(
         "SELECT MAX(focus_rank) FROM shared_list_items WHERE workspace_id = ANY($1::text[]) "
-        "AND is_focus AND id <> $2", _LIST_WORKSPACES, item_id)
+        "AND is_focus AND id <> $2 AND deleted_at IS NULL", _LIST_WORKSPACES, item_id)
     await conn.execute(
         "UPDATE shared_list_items SET is_focus=true, focus_rank=$3, updated_by='james', "
         "updated_at=now() WHERE workspace_id=$1 AND id=$2",
@@ -1335,11 +1593,13 @@ async def get_shared_lists(query: str | None = None) -> str:
             SELECT l.id, l.title, l.is_quick_default, l.workspace_id, p.title AS project,
                    (SELECT count(*) FROM shared_list_items i
                      WHERE i.list_id = l.id AND i.workspace_id = l.workspace_id
-                       AND i.parent_item_id IS NULL AND NOT i.done) AS open_items
+                       AND i.parent_item_id IS NULL AND NOT i.done
+                       AND i.deleted_at IS NULL) AS open_items
               FROM shared_lists l
               LEFT JOIN shared_projects p
                 ON p.id = l.project_id AND p.workspace_id = ANY($1::text[])
              WHERE l.workspace_id = ANY($1::text[]) AND l.archived = false
+               AND l.deleted_at IS NULL
                AND ($2::text = '' OR l.title ILIKE $3 ESCAPE '\')
              ORDER BY l.is_quick_default DESC, (lower(l.title) = 'today') DESC,
                       (l.workspace_id = $4) DESC, p.title NULLS FIRST, l.position, l.title
@@ -1350,12 +1610,12 @@ async def get_shared_lists(query: str | None = None) -> str:
         async def titled(t: str) -> list:
             return await conn.fetch(
                 "SELECT id FROM shared_lists WHERE workspace_id=$1 AND archived=false "
-                "AND lower(title) = $2 ORDER BY created_at", USER_ID, t)
+                "AND deleted_at IS NULL AND lower(title) = $2 ORDER BY created_at", USER_ID, t)
 
         today, focus, fathom = await titled("today"), await titled("focus"), await titled("fathom")
         quick = await conn.fetchval(
             "SELECT id FROM shared_lists WHERE workspace_id=$1 AND archived=false "
-            "AND is_quick_default ORDER BY created_at LIMIT 1", USER_ID)
+            "AND deleted_at IS NULL AND is_quick_default ORDER BY created_at LIMIT 1", USER_ID)
 
     def one(found) -> str | None:
         return str(found[0]["id"]) if len(found) == 1 else None
@@ -1724,7 +1984,7 @@ async def _planner_list_id(conn) -> uuid.UUID:
     await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", f"{PLANNER_WS}:planner-list")
     lid = await conn.fetchval(
         "SELECT id FROM shared_lists WHERE workspace_id=$1 AND title='Planner' "
-        "ORDER BY created_at LIMIT 1", PLANNER_WS)
+        "AND deleted_at IS NULL ORDER BY created_at LIMIT 1", PLANNER_WS)
     if lid:
         return lid
     lid = uuid.uuid4()
@@ -1776,7 +2036,7 @@ def _block_json(r, tasks, run_map=None) -> dict:
 async def _day_blocks(conn, day: date) -> list:
     return await conn.fetch(
         f"SELECT {_ITEM_COLS} FROM shared_list_items WHERE workspace_id=$1 AND is_private "
-        "AND parent_item_id IS NULL "
+        "AND parent_item_id IS NULL AND deleted_at IS NULL "
         "AND start_at >= ($2::date)::timestamp AT TIME ZONE $3 "
         "AND start_at < ($2::date + 1)::timestamp AT TIME ZONE $3 "
         "ORDER BY start_at, created_at", PLANNER_WS, day, PLANNER_TZ)
@@ -1787,7 +2047,8 @@ async def _block_tasks(conn, block_ids: list) -> dict:
     if block_ids:
         rows = await conn.fetch(
             f"SELECT {_ITEM_COLS} FROM shared_list_items WHERE workspace_id=$1 AND is_private "
-            "AND parent_item_id = ANY($2::uuid[]) ORDER BY rank NULLS LAST, created_at",
+            "AND parent_item_id = ANY($2::uuid[]) AND deleted_at IS NULL "
+            "ORDER BY rank NULLS LAST, created_at",
             PLANNER_WS, block_ids)
         for r in rows:
             out.setdefault(r["parent_item_id"], []).append(r)
@@ -1800,7 +2061,8 @@ async def _load_block(conn, block_id, for_update: bool = False):
         return None
     return await conn.fetchrow(
         f"SELECT {_ITEM_COLS} FROM shared_list_items WHERE workspace_id=$1 AND is_private "
-        "AND id=$2 AND parent_item_id IS NULL" + (" FOR UPDATE" if for_update else ""),
+        "AND id=$2 AND parent_item_id IS NULL AND deleted_at IS NULL"
+        + (" FOR UPDATE" if for_update else ""),
         PLANNER_WS, bid)
 
 
@@ -1815,7 +2077,7 @@ async def _day_json(conn, day: date) -> dict:
 async def _task_json_fresh(conn, task_id) -> dict:
     t = await conn.fetchrow(
         f"SELECT {_ITEM_COLS} FROM shared_list_items WHERE workspace_id=$1 AND is_private "
-        "AND id=$2", PLANNER_WS, task_id)
+        "AND id=$2 AND deleted_at IS NULL", PLANNER_WS, task_id)
     block = await _load_block(conn, t["parent_item_id"])
     siblings = (await _block_tasks(conn, [block["id"]]))[block["id"]]
     runs = (await _runs_for(conn, [t["id"]]))[t["id"]]
@@ -1902,7 +2164,8 @@ async def planner_set_day(day: str, blocks) -> str:
                         cur_b = await conn.fetchrow(
                             "SELECT id, start_at, end_at, busy_event_id, planner_lanes "
                             "FROM shared_list_items WHERE workspace_id=$1 AND is_private "
-                            "AND id=$2 AND parent_item_id IS NULL", PLANNER_WS, bid)
+                            "AND id=$2 AND parent_item_id IS NULL AND deleted_at IS NULL",
+                            PLANNER_WS, bid)
                         if cur_b and cur_b["busy_event_id"] and (
                                 cur_b["start_at"] != s or cur_b["end_at"] != e):
                             raise ValueError(
@@ -1946,7 +2209,8 @@ async def planner_set_day(day: str, blocks) -> str:
                         if tid:
                             hit = await conn.fetchrow(
                                 "SELECT id, parent_item_id FROM shared_list_items WHERE "
-                                "workspace_id=$1 AND is_private AND id=$2", PLANNER_WS, tid)
+                                "workspace_id=$1 AND is_private AND id=$2 "
+                                "AND deleted_at IS NULL", PLANNER_WS, tid)
                             if hit is not None and hit["parent_item_id"] is None:
                                 raise ValueError("a block id was given as a task id")
                             tfound = hit["id"] if hit is not None else None
@@ -2022,7 +2286,7 @@ async def planner_add_task(block_id: str, text: str, lane: str | None = None,
                 sid = _uuid_or_none(source_item_id)
                 src = sid and await conn.fetchval(
                     "SELECT id FROM shared_list_items WHERE id=$1 AND workspace_id=$2 "
-                    "AND is_private = false", sid, USER_ID)
+                    "AND is_private = false AND deleted_at IS NULL", sid, USER_ID)
                 if not src:
                     return "Source item not found in the shared lists."
             prefix, stripped = _split_lane_prefix(text or "")
@@ -2067,14 +2331,16 @@ async def _load_task(conn, task_id: str):
         return None
     return await conn.fetchrow(
         f"SELECT {_ITEM_COLS} FROM shared_list_items WHERE workspace_id=$1 AND is_private "
-        "AND id=$2 AND parent_item_id IS NOT NULL FOR UPDATE", PLANNER_WS, tid)
+        "AND id=$2 AND parent_item_id IS NOT NULL AND deleted_at IS NULL FOR UPDATE",
+        PLANNER_WS, tid)
 
 
 async def _settle_block(conn, block_id, now: datetime) -> None:
     counts = await conn.fetchrow(
         "SELECT count(*) AS total, count(*) FILTER (WHERE COALESCE(planner_status,'planned') "
         "NOT IN ('done','skipped')) AS open, min(actual_start) AS first FROM shared_list_items "
-        "WHERE workspace_id=$1 AND is_private AND parent_item_id=$2", PLANNER_WS, block_id)
+        "WHERE workspace_id=$1 AND is_private AND parent_item_id=$2 AND deleted_at IS NULL",
+        PLANNER_WS, block_id)
     if counts["total"] and not counts["open"]:
         await conn.execute(
             "UPDATE shared_list_items SET planner_status='done', done=true, done_at=$3, "
@@ -2090,7 +2356,7 @@ async def _complete_source(conn, task, now: datetime) -> bool:
     status = await conn.execute(
         "UPDATE shared_list_items SET done=true, done_at=$3, updated_by='james', "
         "updated_at=now() WHERE id=$1 AND workspace_id=$2 AND is_private = false "
-        "AND done = false", task["source_item_id"], USER_ID, now)
+        "AND done = false AND deleted_at IS NULL", task["source_item_id"], USER_ID, now)
     return status.endswith(" 1")
 
 
@@ -2108,7 +2374,8 @@ async def planner_start(task_id: str) -> str:
                 return f"Already running: '{t['text']}'."
             active = await conn.fetchval(
                 "SELECT count(*) FROM shared_list_items WHERE workspace_id=$1 AND is_private "
-                "AND parent_item_id IS NOT NULL AND planner_status='active' AND id<>$2",
+                "AND parent_item_id IS NOT NULL AND planner_status='active' AND id<>$2 "
+                "AND deleted_at IS NULL",
                 PLANNER_WS, t["id"])
             if active >= PLANNER_MAX_ACTIVE:
                 return f"At most {PLANNER_MAX_ACTIVE} timers can run at once. Stop one first."
@@ -2175,13 +2442,14 @@ async def planner_snooze(task_id: str, to_block_id: str | None = None) -> str:
                 return "Planner task not found."
             cur = await conn.fetchrow(
                 "SELECT id, start_at, today_date FROM shared_list_items WHERE workspace_id=$1 "
-                "AND is_private AND id=$2", PLANNER_WS, t["parent_item_id"])
+                "AND is_private AND id=$2 AND deleted_at IS NULL", PLANNER_WS, t["parent_item_id"])
             if to_block_id:
                 target = await _load_block(conn, to_block_id, for_update=True)
             else:
                 target = await conn.fetchrow(
                     f"SELECT {_ITEM_COLS} FROM shared_list_items WHERE workspace_id=$1 "
-                    "AND is_private AND parent_item_id IS NULL AND id<>$2 AND start_at >= $3 "
+                    "AND is_private AND parent_item_id IS NULL AND id<>$2 AND deleted_at IS NULL "
+                    "AND start_at >= $3 "
                     "AND start_at < (COALESCE($4::date, ($3::timestamptz AT TIME ZONE $5)::date) + 1)"
                     "::timestamp AT TIME ZONE $5 "
                     "ORDER BY start_at, created_at LIMIT 1 FOR UPDATE",
@@ -2199,8 +2467,8 @@ async def planner_snooze(task_id: str, to_block_id: str | None = None) -> str:
             lanes = await _materialize_lanes(conn, target, all_target)
             others = [r for r in all_target if r["id"] != t["id"]]
             own = await conn.fetchval(
-                "SELECT planner_lane FROM shared_list_items WHERE workspace_id=$1 AND id=$2",
-                PLANNER_WS, t["id"])
+                "SELECT planner_lane FROM shared_list_items WHERE workspace_id=$1 AND id=$2 "
+                "AND deleted_at IS NULL", PLANNER_WS, t["id"])
             lane = (own or "A") if lanes == 2 else None
             await conn.execute(
                 "UPDATE shared_list_items SET parent_item_id=$3, today_date=$4, planner_lane=$5, "
