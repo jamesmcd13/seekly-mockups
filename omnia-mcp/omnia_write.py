@@ -708,7 +708,8 @@ async def delete_todo(kind: str, item_id: str) -> str:
                 "UPDATE item_waits SET blocker_item_id = NULL "
                 "WHERE blocker_item_id = ANY($1::uuid[])", [iid, *(r["id"] for r in subs)])
     extra = f" (and {_plural(len(subs), 'subtask')})" if subs else ""
-    return (f"Moved to-do '{row['text']}'{extra} to the Trash. It can be restored for "
+    # Starts with "Deleted": the GV text-brain counts successes by that prefix.
+    return (f"Deleted to-do '{row['text']}'{extra}. It is in the Trash, restorable for "
             f"{TRASH_RETENTION_DAYS} days (restore_todo).")
 
 
@@ -1107,10 +1108,10 @@ async def soft_delete_contact(contact_id: str) -> str:
                     await conn.execute(
                         "UPDATE contacts SET deleted_at=$2 WHERE id=$1 AND deleted_at IS NULL",
                         cid, now)
-                    return (f"Moved shared contact '{row['name']}' to the Trash (both of you "
-                            f"have now deleted it). It can be restored for {days} days.")
-                return (f"Removed shared contact '{row['name']}' from your view; the other "
-                        f"person still has it. Restorable from the Trash for {days} days.")
+                    return (f"Deleted shared contact '{row['name']}'. Both of you have now "
+                            f"deleted it, so it is in the Trash, restorable for {days} days.")
+                return (f"Deleted shared contact '{row['name']}' from your view only; the "
+                        f"other person still has it. Restorable from the Trash for {days} days.")
             await conn.execute(
                 "UPDATE contacts SET deleted_at=$3 WHERE user_id=$1 AND id=$2",
                 CONTACTS_BUCKET, cid, now)
@@ -1118,7 +1119,8 @@ async def soft_delete_contact(contact_id: str) -> str:
                 "UPDATE reminders SET dismissed_at=$3 WHERE user_id=$1 AND contact_id=$2 "
                 "AND source='manual' AND completed_at IS NULL AND dismissed_at IS NULL",
                 CONTACTS_BUCKET, cid, now)
-    return f"Moved contact '{row['name']}' to the Trash. It can be restored for {days} days."
+    # Starts with "Deleted": the GV text-brain counts successes by that prefix.
+    return f"Deleted contact '{row['name']}'. It is in the Trash, restorable for {days} days."
 
 
 async def update_contact(contact_id: str, name: str | None = None, phone: str | None = None,
