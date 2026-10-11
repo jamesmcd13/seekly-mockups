@@ -719,6 +719,9 @@ async def delete_todo(kind: str, item_id: str) -> str:
 # stamped in the same delete; a child trashed on its own earlier keeps its own
 # timestamp and stays in the Trash. Only these functions read trashed rows.
 
+# Mirrors the backend's settings.trash_retention_days (env TRASH_RETENTION_DAYS,
+# default 30, omnia-platform app/core/config.py + services/trash.retention_days).
+# Change BOTH together; it only drives purge_at in list_trash and reply wording.
 TRASH_RETENTION_DAYS = max(1, int(os.environ.get("TRASH_RETENTION_DAYS", "30") or 30))
 
 
@@ -799,6 +802,48 @@ async def restore_todo(item_id: str) -> str:
     return f"Restored to-do '{row['text']}'{extra} from the Trash{tail}."
 
 
+async def restore_contact(contact_id: str) -> str:
+    """Bring ONE contact back from James's Trash (routes/trash._restore_contact):
+    a fully trashed contact gets deleted_at cleared and the manual follow-ups
+    its delete dismissed (same timestamp) re-opened (services/trash.
+    restore_contact), and James's own hide on it is dropped; a hide-only entry
+    (a shared contact he removed from his view) just loses his hide. The other
+    person's hide is never touched. Ids come from list_trash."""
+    try:
+        cid = uuid.UUID(str(contact_id))
+    except ValueError:
+        return "contact_id must be a valid UUID (see list_trash)."
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT name, primary_email, deleted_at FROM contacts WHERE id=$2 AND "
+                "(user_id=$1 OR visibility='shared') AND merged_into IS NULL FOR UPDATE",
+                CONTACTS_BUCKET, cid)
+            if row is None:
+                return "No such contact in the Trash (see list_trash)."
+            hide = await conn.fetchval(
+                "SELECT hidden_at FROM contact_hides WHERE contact_id=$1 AND owner_key=$2",
+                cid, _HIDE_KEY)
+            label = row["name"] or row["primary_email"] or str(cid)
+            reopened = 0
+            if row["deleted_at"] is not None:
+                ts = row["deleted_at"]
+                await conn.execute(
+                    "UPDATE contacts SET deleted_at=NULL WHERE id=$1 AND deleted_at IS NOT NULL", cid)
+                status = await conn.execute(
+                    "UPDATE reminders SET dismissed_at=NULL WHERE contact_id=$1 AND source='manual' "
+                    "AND dismissed_at=$2", cid, ts)
+                reopened = int(status.split()[-1])
+            elif hide is None:
+                return f"'{label}' is not in the Trash."
+            if hide is not None:
+                await conn.execute(
+                    "DELETE FROM contact_hides WHERE contact_id=$1 AND owner_key=$2", cid, _HIDE_KEY)
+    extra = f" ({_plural(reopened, 'follow-up')} re-opened)" if reopened else ""
+    return f"Restored contact '{label}' from the Trash{extra}."
+
+
 def _trash_entry(type_: str, id_, title, deleted_at, context, child_count: int) -> dict:
     return {"type": type_, "id": str(id_), "title": title or "",
             "deleted_at": _iso(deleted_at),
@@ -810,7 +855,8 @@ def _trash_entry(type_: str, id_, title, deleted_at, context, child_count: int) 
 async def list_trash() -> str:
     """What is in James's Trash inside the retention window, newest first:
     to-dos and lists in his list workspaces (never the planner), plus contacts
-    (fully trashed ones he can see, and shared ones he hid: hidden_only). A
+    (fully trashed ones he can see, and shared ones he hid: hidden_only;
+    restore those with restore_contact, to-dos and lists with restore_todo). A
     subtask trashed with its parent, or an item trashed with its list, is
     folded into that entry's child_count, as the app's Trash page shows it.
     JSON."""
@@ -1396,6 +1442,10 @@ async def add_contact(name: str, email: str | None = None, phone: str | None = N
                         await conn.execute(
                             "UPDATE contacts SET deleted_at=NULL, updated_at=now() "
                             "WHERE user_id=$1 AND id=$2", CONTACTS_BUCKET, trashed["id"])
+                        # contact_trash.revive_for_resave: James's own hide goes too.
+                        await conn.execute(
+                            "DELETE FROM contact_hides WHERE contact_id=$1 AND owner_key=$2",
+                            trashed["id"], _HIDE_KEY)
                         msg = await _merge_into(conn, trashed, phone, company, notes)
                         return "Restored from the Trash. " + msg
                     await _release_email(conn, email)
@@ -2243,7 +2293,8 @@ async def planner_set_day(day: str, blocks) -> str:
                     kept_blocks.append(bid)
                 await conn.execute(
                     "DELETE FROM shared_list_items WHERE workspace_id=$1 AND is_private "
-                    "AND parent_item_id = ANY($2::uuid[]) AND NOT (id = ANY($3::uuid[]))",
+                    "AND parent_item_id = ANY($2::uuid[]) AND NOT (id = ANY($3::uuid[])) "
+                    "AND deleted_at IS NULL",
                     PLANNER_WS, kept_blocks, claimed)
                 busy_dropped = [r["text"] for k, r in existing.items()
                                 if k not in keep and r["busy_event_id"]]

@@ -100,6 +100,9 @@ async def query(sql: str) -> str:
 
     Use for pipeline/contacts/messages until typed tools exist. SELECT only;
     one statement; results capped at 100 rows. Always scope by your user_id.
+    Trash bin: trashed rows have deleted_at set; add deleted_at IS NULL for
+    shared_list_items / shared_lists / contacts / projects / pages, and exclude
+    contacts with a contact_hides row for owner_key 'james' (hidden from James).
 
     Args:
         sql: a single SELECT or WITH statement.
@@ -238,10 +241,24 @@ async def restore_todo(item_id: str) -> str:
 
 
 @mcp.tool()
+async def restore_contact(contact_id: str) -> str:
+    """Bring a deleted contact back from the Trash (list_trash type 'contact').
+    A contact James only removed from his view (hidden_only) shows for him
+    again; a fully trashed one comes back with its follow-ups. Reversible, so
+    no confirmation is needed.
+
+    Args:
+        contact_id: the contact UUID, from list_trash.
+    """
+    return await omniaw.restore_contact(contact_id)
+
+
+@mcp.tool()
 async def list_trash() -> str:
     """What is in James's Trash (last 30 days), newest first: to-dos, lists and
     contacts, each with deleted_at and purge_at (when it is removed for good).
-    hidden_only = a shared contact removed from James's view only. JSON.
+    hidden_only = a shared contact removed from James's view only. Restore with
+    restore_todo (to-dos, lists) or restore_contact (contacts). JSON.
     """
     return await omniaw.list_trash()
 
