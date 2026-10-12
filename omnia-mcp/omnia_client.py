@@ -93,11 +93,13 @@ async def get_lists(include_legacy: bool = False) -> str:
         SELECT l.id, l.title, l.workspace_id, l.is_quick_default, p.title AS project,
                (SELECT count(*) FROM shared_list_items i
                  WHERE i.list_id = l.id AND i.workspace_id = l.workspace_id
-                   AND i.parent_item_id IS NULL AND NOT i.done) AS open_items
+                   AND i.parent_item_id IS NULL AND NOT i.done
+                   AND i.deleted_at IS NULL) AS open_items
           FROM shared_lists l
           LEFT JOIN shared_projects p
             ON p.id = l.project_id AND p.workspace_id = ANY($1::text[])
          WHERE l.workspace_id = ANY($1::text[]) AND NOT l.archived
+           AND l.deleted_at IS NULL
          ORDER BY l.is_quick_default DESC, (lower(l.title) = 'today') DESC,
                   (l.workspace_id = $2) DESC, p.title NULLS FIRST, l.position, l.title
         """,
@@ -163,7 +165,9 @@ async def get_tasks(status: str = "open", list_name: str | None = None,
     """Shared Lists to-dos (top-level items). status open|done|all; list_name =
     partial list title; due today (due today or earlier, or pinned to Today) |
     week | overdue. Each line ends with the item id."""
-    where = ["i.workspace_id = ANY($1::text[])", "NOT l.archived", "i.parent_item_id IS NULL"]
+    # Trash bin: trashed items / lists (deleted_at set) are hidden everywhere.
+    where = ["i.workspace_id = ANY($1::text[])", "NOT l.archived", "i.parent_item_id IS NULL",
+             "i.deleted_at IS NULL", "l.deleted_at IS NULL"]
     args: list = [_LIST_WORKSPACES]
     if status == "open":
         where.append("NOT i.done")
@@ -254,7 +258,8 @@ async def get_events(days_ahead: int = 7) -> str:
 async def get_contacts(query: str | None = None, limit: int = 20) -> str:
     """Contacts (name, phone, email, id) from the /contacts book: James's own
     rows (CONTACTS_BUCKET) plus contacts Michael shared, live rows only (the
-    same set GET /v1/partner-contacts lists). If `query` is given,
+    same set GET /v1/partner-contacts lists), minus shared rows James hid
+    (contact_hides, Trash bin; owner_key = his tenant key). If `query` is given,
     case-insensitive contains-match on name/email/phone (the LIKE
     metacharacters % and _ are escaped)."""
     try:
@@ -263,8 +268,10 @@ async def get_contacts(query: str | None = None, limit: int = 20) -> str:
         lim = 20
     lim = max(1, min(lim, 200))
     where = ["(user_id = $1 OR visibility = 'shared')", "archived_at IS NULL",
-             "deleted_at IS NULL", "is_active"]
-    args: list = [CONTACTS_BUCKET]
+             "deleted_at IS NULL", "is_active",
+             "NOT EXISTS (SELECT 1 FROM contact_hides ch WHERE ch.contact_id = contacts.id "
+             "AND ch.owner_key = $2)"]
+    args: list = [CONTACTS_BUCKET, USER_ID]
     q = (query or "").strip()
     if q:
         # Escape LIKE wildcards so e.g. "50%" or "a_b" match literally.

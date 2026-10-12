@@ -100,6 +100,9 @@ async def query(sql: str) -> str:
 
     Use for pipeline/contacts/messages until typed tools exist. SELECT only;
     one statement; results capped at 100 rows. Always scope by your user_id.
+    Trash bin: trashed rows have deleted_at set; add deleted_at IS NULL for
+    shared_list_items / shared_lists / contacts / projects / pages, and exclude
+    contacts with a contact_hides row for owner_key 'james' (hidden from James).
 
     Args:
         sql: a single SELECT or WITH statement.
@@ -212,16 +215,52 @@ async def update_todo(kind: str, item_id: str, text: str = "", due_date: str = "
 
 @mcp.tool()
 async def delete_todo(kind: str, item_id: str) -> str:
-    """DELETE ONE Shared Lists to-do (and its subtasks). DESTRUCTIVE: only call
-    after the user has confirmed the exact target with the literal word DELETE.
-    Reversible via DB point-in-time restore, but do not call speculatively.
-    Items in the retired Omnia Lists are refused (read-only).
+    """Delete ONE Shared Lists to-do (and its subtasks): it goes to the Trash and
+    can be restored for 30 days (restore_todo, or the app's Trash page). Confirm
+    the exact item with the user first (a normal yes is enough); do not call
+    speculatively. Items in the retired Omnia Lists are refused (read-only).
 
     Args:
         kind: 'task' or 'shared' (both mean a Shared Lists item now).
         item_id: the row UUID (resolve + echo the exact item to the user first).
     """
     return await omniaw.delete_todo(kind, item_id)
+
+
+@mcp.tool()
+async def restore_todo(item_id: str) -> str:
+    """Bring a deleted to-do back from the Trash (with the subtasks deleted with
+    it; a trashed parent item or list comes back too). A trashed LIST id
+    restores the list and the items deleted with it. Restoring is reversible,
+    so no confirmation is needed.
+
+    Args:
+        item_id: the to-do (or list) UUID, from list_trash.
+    """
+    return await omniaw.restore_todo(item_id)
+
+
+@mcp.tool()
+async def restore_contact(contact_id: str) -> str:
+    """Bring a deleted contact back from the Trash (list_trash type 'contact').
+    A contact James only removed from his view (hidden_only) shows for him
+    again; a fully trashed one comes back with its follow-ups. Reversible, so
+    no confirmation is needed.
+
+    Args:
+        contact_id: the contact UUID, from list_trash.
+    """
+    return await omniaw.restore_contact(contact_id)
+
+
+@mcp.tool()
+async def list_trash() -> str:
+    """What is in James's Trash (last 30 days), newest first: to-dos, lists and
+    contacts, each with deleted_at and purge_at (when it is removed for good).
+    hidden_only = a shared contact removed from James's view only. Restore with
+    restore_todo (to-dos, lists) or restore_contact (contacts). JSON.
+    """
+    return await omniaw.list_trash()
 
 
 @mcp.tool()
@@ -244,9 +283,11 @@ async def update_contact(contact_id: str, name: str = "", phone: str = "",
 
 @mcp.tool()
 async def delete_contact(contact_id: str) -> str:
-    """ARCHIVE ONE contact (recoverable; sets archived_at, like the app's
-    delete). Contacts shared with Michael are refused. DESTRUCTIVE-ish:
-    only call after the user confirmed the exact contact with the word DELETE.
+    """Delete ONE contact, like the app's delete: a private contact goes to the
+    Trash; a contact shared with Michael is removed from James's view only
+    (Michael keeps it) and reaches the Trash once both have deleted it. Either
+    way it can be restored for 30 days. Confirm the exact contact with the user
+    first (a normal yes is enough).
 
     Args:
         contact_id: the contact UUID (resolve + echo the exact contact first).
